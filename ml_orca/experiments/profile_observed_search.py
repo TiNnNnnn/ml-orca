@@ -19,9 +19,8 @@ def load_sample(manifest, vocabulary, case_id):
     native = json.loads(read_snapshot(snapshots['graph']))
     builder = ObservedFeatureBuilder(snapshots, {n['rule_hash']: i for i, n in enumerate(native['nodes'])})
     features = builder(item)
-    from ml_orca.encoding.rule_policy_encoding import encode_sequence
-    features['sequences'] = {k: [encode_sequence(s, vocabulary) for s in rows]
-                            for k, rows in features['sequences'].items()}
+    from ml_orca.encoding.rule_policy_encoding import encode_sequence_groups
+    features['sequences'] = encode_sequence_groups(features['sequences'], vocabulary)
     return features, item['target_log1p_ms']
 
 

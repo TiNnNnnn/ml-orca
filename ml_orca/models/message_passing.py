@@ -14,10 +14,11 @@ class DirectedRuleAggregation(nn.Module):
 
     def forward(self, nodes, edges, positions, roots=None):
         width = self.predecessor.out_features
+        node_count = nodes.shape[0] if nodes.ndim == 2 else 0
         if (nodes.ndim != 2 or nodes.shape[1] != width or not torch.isfinite(nodes).all()
                 or positions.shape != (len(edges), width) or positions.dtype != nodes.dtype
                 or positions.device != nodes.device or not torch.isfinite(positions).all()
-                or any(len(e) != 2 or any(type(i) is not int or not 0 <= i < len(nodes) for i in e) for e in edges)):
+                or any(len(e) != 2 or any(type(i) is not int or not 0 <= i < node_count for i in e) for e in edges)):
             raise ValueError('invalid directed graph tensors or endpoints')
         if self.rooted:
             if (not isinstance(roots, torch.Tensor) or roots.shape != (len(edges), 2, width)

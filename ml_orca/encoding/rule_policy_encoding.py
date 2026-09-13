@@ -313,6 +313,23 @@ def encode_sequence(sequence, vocabulary):
             'unknown_tokens': sum(token not in vocabulary for token, _ in sequence)}
 
 
+def encode_sequence_groups(groups, vocabulary):
+    """Share equal, read-only input sequences; retain every ordered occurrence.
+
+    This is input storage only, not an embedding cache. JSON keys preserve
+    numeric types and signed zero, and reject nonfinite values as the encoder does.
+    """
+    shared, encoded = {}, {}
+    for channel, sequences in groups.items():
+        encoded[channel] = []
+        for sequence in sequences:
+            key = json.dumps(sequence, allow_nan=False)
+            if key not in shared:
+                shared[key] = encode_sequence(sequence, vocabulary)
+            encoded[channel].append(shared[key])
+    return encoded
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--samples', type=Path, required=True)

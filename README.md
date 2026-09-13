@@ -156,6 +156,12 @@ Tree-LSTM，孩子顺序不变。按依赖深度归纳，每个节点仍计算�
 `tests/scalar_tree_reference.py`，验证有序/变 arity/多树/空约束、全部参数梯度和连续 Adam 更新。
 不跨训练步骤缓存 learned embedding，不改 batch size、精度、目标或样本顺序。
 
+固定输入的相同序列共享只读 Python 对象；每次前向仍按当前参数重新编码，再按原顺序
+取回全部重复项。对象身份索引只活在一次前向内，不跨更新复用。约束端口批量写入
+原有的 padded token context，保留所有符号引用及梯度；消息层将不变的节点数量移出
+逐边校验循环，仍校验全部端点。输入/模型测试覆盖非法类型、非有限数、padding 梯度、
+共享对象修改后的重新校验，以及与原逐约束实现的参数/Adam 对照。
+
 ### 固定输入缓存与有序预取
 
 `train-observed --input-cache-mb 32768 --input-workers 0` 可在大内存主机保留

@@ -21,13 +21,18 @@ class SharedSequenceEncoder(nn.Module):
             # in THIS forward, then gather every occurrence back. Autograd sums
             # all occurrence gradients; no edge/count is removed or cached across
             # optimizer steps. Per-token differentiable contexts must stay separate.
-            unique, lookup, indices = [], {}, []
+            unique, lookup, indices, identities = [], {}, [], {}
             for sequence in sequences:
+                identity = id(sequence)
+                if identity in identities:
+                    indices.append(identities[identity])
+                    continue
                 key = json.dumps(sequence, sort_keys=True, allow_nan=False)
                 if key not in lookup:
                     lookup[key] = len(unique)
                     unique.append(sequence)
                 indices.append(lookup[key])
+                identities[identity] = lookup[key]
             if len(unique) < len(sequences):
                 encoded = self._encode(unique)
                 return encoded.index_select(0, torch.tensor(indices, device=encoded.device))
@@ -60,11 +65,16 @@ class SharedSequenceEncoder(nn.Module):
             raise ValueError('numeric input must be finite with zero storage for missing values')
         embedded = self.tokens(pad_sequence(ids, batch_first=True).to(device)) + self.numbers(numeric.to(device))
         if token_contexts is not None:
-            for context, length in zip(token_contexts, lengths):
-                if (not isinstance(context, torch.Tensor) or context.shape != (length, self.tokens.embedding_dim)
-                        or context.device != device or context.dtype != dtype):
+            if isinstance(token_contexts, torch.Tensor):
+                contexts = token_contexts
+                if contexts.shape != embedded.shape or contexts.device != device or contexts.dtype != dtype:
                     raise ValueError('invalid token context')
-            contexts = pad_sequence(token_contexts, batch_first=True)
+            else:
+                for context, length in zip(token_contexts, lengths):
+                    if (not isinstance(context, torch.Tensor) or context.shape != (length, self.tokens.embedding_dim)
+                            or context.device != device or context.dtype != dtype):
+                        raise ValueError('invalid token context')
+                contexts = pad_sequence(token_contexts, batch_first=True)
             if not torch.isfinite(contexts).all():
                 raise ValueError('invalid token context')
             embedded = embedded + contexts

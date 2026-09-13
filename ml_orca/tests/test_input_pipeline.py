@@ -10,7 +10,7 @@ except ModuleNotFoundError:
 
 from ml_orca.common.artifacts import artifact_snapshot
 from ml_orca.encoding.observed_search import observed_features
-from ml_orca.encoding.rule_policy_encoding import encode_sequence, fit_vocabulary
+from ml_orca.encoding.rule_policy_encoding import encode_sequence, encode_sequence_groups, fit_vocabulary
 from ml_orca.models.rule_tree_model import ObservedSearchPredictor
 from ml_orca.tests.test_rule_history_encoding import history_fixture
 from ml_orca.training.inputs import ObservedInputDataset, input_loader, resident_size
@@ -73,6 +73,20 @@ class InputPipelineTest(unittest.TestCase):
         self.assertEqual(small.used_bytes, 0)
         with self.assertRaises(TypeError):
             resident_size({'learned': torch.ones(1, requires_grad=True)})
+
+    def test_sequence_sharing_preserves_values_occurrences_and_numeric_validation(self):
+        groups = {'edge': [[('x', 1.)]] * 100, 'other': [[('x', 1.)], [('x', -0.)], [('x', 0.)]]}
+        vocabulary = fit_vocabulary([groups])
+        expected = {k: [encode_sequence(s, vocabulary) for s in rows] for k, rows in groups.items()}
+        shared = encode_sequence_groups(groups, vocabulary)
+        self.assertEqual(shared, expected)
+        self.assertIs(shared['edge'][0], shared['edge'][-1])
+        self.assertIs(shared['edge'][0], shared['other'][0])
+        self.assertIsNot(shared['other'][1], shared['other'][2])
+        self.assertLess(resident_size(shared), resident_size(expected) / 4)
+        for invalid in (float('nan'), float('inf'), -float('inf')):
+            with self.assertRaises(ValueError):
+                encode_sequence_groups({'edge': [[('x', invalid)]]}, vocabulary)
 
     def test_spawn_prefetch_preserves_order_tuples_rng_and_relocation(self):
         original_root = '/original/ml-orca-test'

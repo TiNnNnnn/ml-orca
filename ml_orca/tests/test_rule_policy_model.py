@@ -74,11 +74,14 @@ class SequenceEncoderTest(unittest.TestCase):
                 self.model(bad)
 
     def test_equal_input_interning_preserves_outputs_gradients_and_validation(self):
+        import json
         from unittest.mock import patch
         sequences = [self.encoded[i % 2] for i in range(31)]
-        with patch.object(self.model, '_encode', wraps=self.model._encode) as encode:
+        with patch.object(self.model, '_encode', wraps=self.model._encode) as encode, \
+                patch('ml_orca.models.sequence.json.dumps', wraps=json.dumps) as serialize:
             actual = self.model(sequences)
             self.assertEqual(len(encode.call_args.args[0]), 2)
+            self.assertEqual(serialize.call_count, 2)
         weights = torch.linspace(-2., 3., len(sequences)).unsqueeze(1)
         (actual * weights).sum().backward()
         grads = {name: p.grad.clone() for name, p in self.model.named_parameters()}
@@ -93,6 +96,11 @@ class SequenceEncoderTest(unittest.TestCase):
         bad[-1]['known_number'][0] = int(bad[-1]['known_number'][0])
         with self.assertRaises(ValueError):
             self.model(bad)
+        mutated = deepcopy(sequences)
+        self.model(mutated)
+        mutated[0]['tokens'][0] = True
+        with self.assertRaises(ValueError):
+            self.model(mutated)  # Identity reuse never bypasses validation across forwards.
         with torch.no_grad():
             self.model.numbers.weight.add_(.1)
         self.assertFalse(torch.equal(actual, self.model(sequences)))
@@ -144,6 +152,25 @@ class SequenceEncoderTest(unittest.TestCase):
         self.assertEqual(tuple(model([], []).shape), (0, 8))
         with self.assertRaises(ValueError):
             model(rules, contexts[:1])
+
+    def test_padded_token_contexts_preserve_outputs_and_all_gradients(self):
+        contexts = [torch.randn(len(s['tokens']), 8, requires_grad=True) for s in self.encoded]
+        padded = torch.nn.utils.rnn.pad_sequence(contexts, batch_first=True).detach().requires_grad_()
+        expected = self.model(self.encoded, contexts)
+        expected.square().sum().backward()
+        gradients = {n: p.grad.clone() for n, p in self.model.named_parameters()}
+        self.model.zero_grad()
+        actual = self.model(self.encoded, padded)
+        actual.square().sum().backward()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for name, parameter in self.model.named_parameters():
+            torch.testing.assert_close(parameter.grad, gradients[name], rtol=0, atol=0)
+        for row, context in enumerate(contexts):
+            torch.testing.assert_close(padded.grad[row, :len(context)], context.grad, rtol=0, atol=0)
+            self.assertTrue((padded.grad[row, len(context):] == 0).all())
+        for invalid in (padded[:, :-1], padded.double(), padded.detach() * float('nan')):
+            with self.assertRaisesRegex(ValueError, 'invalid token context'):
+                self.model(self.encoded, invalid)
 
     def test_query_metadata_context_is_bound_per_source_and_identity_invariant(self):
         from ml_orca.models.rule_policy_model import query_context_embedding, SharedSequenceEncoder

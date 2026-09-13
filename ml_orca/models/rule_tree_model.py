@@ -159,13 +159,15 @@ class RuleTreeEncoder(nn.Module):
         # One gather for all constraint ports, retaining every occurrence/gradient.
         port_indices = [r for _, refs in references for r in refs]
         ports = symbols.index_select(0, torch.tensor(port_indices, dtype=torch.long, device=initial.device))
-        port_groups = ports.split([len(refs) for _, refs in references])
-        contexts = []
-        for sequence, (tokens, _), values in zip(inputs['rule_constraint'], references, port_groups):
-            context = initial.new_zeros((len(sequence['tokens']), initial.shape[1]))
-            if tokens:
-                context = context.index_copy(0, torch.tensor(tokens, device=initial.device), values)
-            contexts.append(context)
+        lengths = [len(s['tokens']) for s in inputs['rule_constraint']]
+        longest = max(lengths, default=0)
+        token_indices = [row * longest + token for row, (tokens, _) in enumerate(references) for token in tokens]
+        # Constraint token slots are disjoint and validated above. One scatter
+        # retains every bound symbol/gradient without one CUDA op per constraint.
+        contexts = initial.new_zeros((len(lengths) * longest, initial.shape[1]))
+        if token_indices:
+            contexts = contexts.index_copy(0, torch.tensor(token_indices, device=initial.device), ports)
+        contexts = contexts.reshape(len(lengths), longest, initial.shape[1])
         constraints = encoder(inputs['rule_constraint'], contexts)
         incidence = [i for i, (_, refs) in enumerate(references) for _ in refs]
         bound_symbols = mean_rows(constraints.index_select(0, torch.tensor(incidence, dtype=torch.long, device=initial.device)),

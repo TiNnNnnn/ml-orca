@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ml_orca.common.artifacts import read_snapshot, relocate_artifacts
-from ml_orca.encoding.rule_policy_encoding import encode_sequence
+from ml_orca.encoding.rule_policy_encoding import encode_sequence_groups
 
 
 def resident_size(value):
@@ -64,8 +64,7 @@ class ObservedInputDataset:
                 self.cache[index] = cached
             else:
                 data = self.builder(item, raw)
-                data['sequences'] = {k: [encode_sequence(s, self.vocabulary) for s in rows]
-                                     for k, rows in data['sequences'].items()}
+                data['sequences'] = encode_sequence_groups(data['sequences'], self.vocabulary)
                 size = resident_size(data) if self.cache_bytes else 0
                 if self.cache_bytes and size <= self.cache_bytes:
                     while self.used_bytes + size > self.cache_bytes:
