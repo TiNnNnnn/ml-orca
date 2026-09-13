@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ml-orca"
+version = "0.1.0"
+description = "Trace collection, rule graph encoding and machine learning for pgORCA"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = ["sqlglot==23.12.1"]
+
+[project.optional-dependencies]
+training = ["torch>=2.2,<3"]
+plots = ["matplotlib>=3.6"]
+
+[project.scripts]
+ml-orca = "ml_orca.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["ml_orca*"]
+
+[tool.setuptools.package-data]
+ml_orca = ["collect/*.sh", "experiments/*.java"]

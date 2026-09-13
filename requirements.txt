@@ -1,0 +1,2 @@
+# Workload SQL/schema import and structural query encoding; no network dependency.
+sqlglot==23.12.1

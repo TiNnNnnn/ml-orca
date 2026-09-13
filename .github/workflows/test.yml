@@ -1,0 +1,20 @@
+name: ml-orca
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install -e .
+      - run: python -m pip install 'torch>=2.2,<3' --index-url https://download.pytorch.org/whl/cpu
+      - run: python -B -m unittest discover -s ml_orca/tests -t .
+      - run: ml-orca --help
