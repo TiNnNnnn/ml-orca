@@ -2,7 +2,6 @@
 import argparse
 import cProfile
 from copy import deepcopy
-import gzip
 import importlib.util
 import json
 from pathlib import Path
@@ -11,29 +10,18 @@ from statistics import median
 import time
 
 from ml_orca.common.artifacts import read_snapshot, artifact_snapshot, relocate_artifacts
-from ml_orca.encoding.observed_search import observed_features
-from ml_orca.encoding.query_policy_encoding import query_context
-from ml_orca.encoding.rule_policy_encoding import input_sequences, encode_sequence
+from ml_orca.encoding.observed_search import ObservedFeatureBuilder
 
 
 def load_sample(manifest, vocabulary, case_id):
     item = next(i for i in manifest['queries'] if i['case']['case_id'] == case_id)
-    graph = json.loads(gzip.decompress(read_snapshot(item['graph_snapshot'])))
-    if graph['case'] != item['case']:
-        raise ValueError('graph/query identity mismatch')
-    snapshot = graph['source_files']['context']
-    catalog = json.loads(read_snapshot(snapshot))
-    if catalog['status'] != 'ok' or not catalog['capture_input_endpoints_equal']:
-        raise ValueError('invalid catalog capture')
-    static = manifest['input_snapshots']['graph']
-    native = json.loads(read_snapshot(static))
-    base = input_sequences({'query_sql': item['case']['query'], 'graph_snapshot': static,
-        'catalog_snapshot': snapshot,
-        'candidate_policy': catalog['resolved_policies']['behavior']['snapshot']['rules']}, static, tree_rules=True)
-    features = observed_features(base, graph, query_context(item['case']['query'], catalog['catalog']),
-                                {n['rule_hash']: i for i, n in enumerate(native['nodes'])})
+    snapshots = dict(manifest['input_snapshots'])
+    native = json.loads(read_snapshot(snapshots['graph']))
+    builder = ObservedFeatureBuilder(snapshots, {n['rule_hash']: i for i, n in enumerate(native['nodes'])})
+    features = builder(item)
+    from ml_orca.encoding.rule_policy_encoding import encode_sequence
     features['sequences'] = {k: [encode_sequence(s, vocabulary) for s in rows]
-                             for k, rows in features['sequences'].items()}
+                            for k, rows in features['sequences'].items()}
     return features, item['target_log1p_ms']
 
 
@@ -78,16 +66,66 @@ def verify_cpu(model, checkpoint, features, labels):
     return report
 
 
+def profile_inputs(args):
+    """Measure fixed-input preparation/IPC, not GPU overlap or model quality."""
+    from ml_orca.training.inputs import ObservedInputDataset, input_loader
+    artifacts = artifact_snapshot({'manifest': args.manifest,
+                                   'vocabulary': args.manifest.parent / 'vocabulary.json'})
+    manifest = json.loads(read_snapshot(artifacts['manifest']))
+    vocabulary = json.loads(read_snapshot(artifacts['vocabulary']))
+    by_id = {i['case']['case_id']: i for i in manifest['queries']}
+    items = [by_id[case] for case in args.case]
+    snapshots = dict(manifest['input_snapshots'])
+    native = json.loads(read_snapshot(snapshots['graph']))
+    builder = ObservedFeatureBuilder(snapshots, {n['rule_hash']: i for i, n in enumerate(native['nodes'])})
+    dataset = ObservedInputDataset(items, builder, vocabulary,
+        args.input_cache_mb * 1024 * 1024 // max(1, args.input_workers), args.artifact_root)
+    order = list(range(len(items)))
+    loader = input_loader(dataset, order, args.input_workers, args.input_prefetch)
+    report = {'scope': 'input_preparation_and_ipc_not_gpu_overlap_or_training_speedup',
+              'workers': args.input_workers, 'cache_mb_total': args.input_cache_mb,
+              'prefetch': args.input_prefetch, 'artifacts': artifacts, 'passes': []}
+    for repeat in range(args.repeats + 1):
+        start = time.perf_counter()
+        prepared = iter(loader)
+        rows = []
+        for expected in order:
+            before = time.perf_counter()
+            index, features, stats = next(prepared)
+            elapsed = time.perf_counter() - before
+            if index != expected:
+                raise ValueError('input order changed')
+            rows.append({'case_id': items[index]['case']['case_id'], 'wait_seconds': elapsed,
+                         'trees': len(features['history_trees']), 'contexts': len(features['history_contexts']),
+                         'edges': len(features['history_edges']), **stats})
+            del features
+        result = {'pass': repeat, 'cold': repeat == 0,
+                  'seconds': time.perf_counter() - start, 'cases': rows}
+        report['passes'].append(result)
+        print(json.dumps(result), flush=True)
+        del prepared
+    del loader, dataset
+    for snapshot in artifacts.values():
+        read_snapshot(snapshot)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open('x') as stream:
+        json.dump(report, stream, indent=2, allow_nan=False)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, required=True)
-    parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--case', action='append', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--threads', type=int, default=1)
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--artifact-root', nargs=2, metavar=('SOURCE', 'DESTINATION'))
     parser.add_argument('--repeats', type=int, default=3)
+    parser.add_argument('--inputs-only', action='store_true', help='profile preparation/cache/IPC only; no model updates')
+    parser.add_argument('--input-workers', type=int, default=0)
+    parser.add_argument('--input-cache-mb', type=int, default=0)
+    parser.add_argument('--input-prefetch', type=int, default=2)
     parser.add_argument('--profile', action='store_true', help='additional instrumented step, excluded from timings')
     parser.add_argument('--verify-cpu', action='store_true', help='additional CPU/CUDA gradient and Adam checks, excluded from timings')
     parser.add_argument('--reference-source', type=Path, help='trusted archived rule_tree_model.py to compare')
@@ -96,7 +134,15 @@ def main():
         parser.error('positive threads and repeats required')
     if args.output.exists():
         parser.error('output already exists')
+    if args.input_workers < 0 or args.input_cache_mb < 0 or args.input_prefetch < 1:
+        parser.error('nonnegative workers/cache and positive prefetch required')
+    if not args.inputs_only and args.checkpoint is None:
+        parser.error('--checkpoint required unless --inputs-only')
+    if args.inputs_only and (args.profile or args.verify_cpu or args.reference_source):
+        parser.error('model diagnostics cannot be combined with --inputs-only')
     with relocate_artifacts(args.artifact_root):
+        if args.inputs_only:
+            return profile_inputs(args)
         return profile(args)
 
 

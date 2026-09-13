@@ -156,6 +156,36 @@ Tree-LSTM，孩子顺序不变。按依赖深度归纳，每个节点仍计算�
 `tests/scalar_tree_reference.py`，验证有序/变 arity/多树/空约束、全部参数梯度和连续 Adam 更新。
 不跨训练步骤缓存 learned embedding，不改 batch size、精度、目标或样本顺序。
 
+### 固定输入缓存与有序预取
+
+`train-observed --input-cache-mb 32768 --input-workers 0` 可在大内存主机保留
+至多 32 GiB（按 Python 对象大小保守计数）的固定输入编码，避免每轮重复解压、JSON、
+SQL 绑定及 token 编码。缓存不含 Tensor 或 learned embedding；**每次命中仍读取原图并
+校验 size/CRC**。超预算按 LRU 淘汰，单个超大输入不缓存，绝不删边/树/样本。
+第一遍包含对象大小统计和缓存填充开销；命中率不足时不能预期同样的收益。
+
+`--input-workers N --input-prefetch 1` 使用 PyTorch DataLoader 的 spawn 多进程与
+persistent workers。CPU 准备可与训练重叠；采用独立 RNG、有序 sampler 和不转换输入的
+collate，逐查询 Adam 更新/恢复位置/验证顺序不变。缓存总预算平分到各 worker，
+不包含运行时、在途消息和模型内存。完整 Python 大图跨进程复制可能比主进程缓存慢；
+**因此默认不启用多进程，先测量再选择**，不能把更多 worker 当作必然加速。
+
+进度记录将主进程等待时间与 worker 的校验、编码时间、缓存命中和保留字节分别记录。
+默认 `--input-cache-mb 0 --input-workers 0` 不增加缓存占用。CPU 测试逐位对照原输入、
+预测、全部梯度和连续 Adam 更新，并覆盖 byte budget、文件变化拒绝、跨机器映射与 RNG。
+
+仅测量已有图的输入准备/缓存/IPC（不运行 SQL、不更新模型；不代表 GPU 重叠收益）：
+
+```sh
+python3 -m ml_orca profile-observed --inputs-only \
+  --manifest /data/observed/manifest.json \
+  --case lobsters:131 --case discourse:3990 \
+  --input-cache-mb 32768 --input-workers 0 --repeats 2 \
+  --output output/input-cache.json
+```
+
+报告区分首次填充与后续重复读取；完整训练时间仍需结合前向、反向、验证和真实命中率。
+
 固定 checkpoint 的完整真实图测速（不执行 SQL、不改训练 checkpoint）：
 
 ```sh

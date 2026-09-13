@@ -4,7 +4,6 @@
 import argparse
 from collections import Counter
 from datetime import datetime, timezone
-import gzip
 import json
 import math
 from pathlib import Path
@@ -16,15 +15,14 @@ import torch
 
 from ml_orca.common.artifacts import read_snapshot, relocate_artifacts
 from ml_orca.common.paths import package_sources
-from ml_orca.encoding.query_policy_encoding import query_context
-from ml_orca.encoding.rule_policy_encoding import input_sequences, encode_sequence
 from ml_orca.common.artifacts import artifact_snapshot
 
 
 from ml_orca.objectives.observed_search import TARGETS, observed_target, validate_frozen_target
-from ml_orca.encoding.observed_search import observed_features
+from ml_orca.encoding.observed_search import observed_features, ObservedFeatureBuilder
 from ml_orca.models.rule_tree_model import ObservedSearchPredictor
 from ml_orca.training.runtime import training_device, synchronize, runtime_metadata
+from ml_orca.training.inputs import ObservedInputDataset, input_loader
 
 
 def internal_split(family, seed):
@@ -90,6 +88,9 @@ def main():
     parser.add_argument('--width', type=int, default=32)
     parser.add_argument('--threads', type=int, default=1)
     parser.add_argument('--device', default='cpu', help='cpu or cuda[:index]; no implicit fallback')
+    parser.add_argument('--input-workers', type=int, default=0, help='CPU preparation processes; ordered, one query per Adam step')
+    parser.add_argument('--input-cache-mb', type=int, default=0, help='total retained Python feature budget, divided among workers')
+    parser.add_argument('--input-prefetch', type=int, default=2, help='in-flight queries per worker, outside retained-cache budget')
     parser.add_argument('--artifact-root', nargs=2, metavar=('SOURCE', 'DESTINATION'),
                         help='absolute repository roots; retain original content checks and identities')
     parser.add_argument('--resume', type=Path, help='checkpoint beside its frozen manifest and vocabulary')
@@ -97,6 +98,8 @@ def main():
     args = parser.parse_args()
     if args.epochs < 1 or args.width < 1 or args.threads < 1:
         parser.error('positive epochs, width and threads required')
+    if args.input_workers < 0 or args.input_cache_mb < 0 or args.input_prefetch < 1:
+        parser.error('nonnegative input workers/cache and positive prefetch required')
     with relocate_artifacts(args.artifact_root):
         return train(args)
 
@@ -121,28 +124,8 @@ def train(args):
         raise ValueError('audit population mismatch')
     native = json.loads(read_snapshot(snapshots['graph']))
     indices = {n['rule_hash']: i for i, n in enumerate(native['nodes'])}
-    catalogs, bases, items, excluded, tokens = {}, {}, [], [], set()
-
-    def feature(item):
-        app = item['case']['dataset']
-        graph = json.loads(gzip.decompress(read_snapshot(item['graph_snapshot'])))
-        if graph['case'] != item['case']:
-            raise ValueError('graph/query identity mismatch')
-        if app not in catalogs:
-            snapshot = graph['source_files']['context']
-            snapshots['catalog:' + app] = snapshot
-            catalogs[app] = json.loads(read_snapshot(snapshot))
-            context = catalogs[app]
-            if not context['capture_input_endpoints_equal'] or context['status'] != 'ok':
-                raise ValueError('invalid catalog capture')
-            policy = context['resolved_policies']['behavior']
-            if policy['status'] != 'ok':
-                raise ValueError('unresolved policy')
-            bases[app] = input_sequences({'query_sql': item['case']['query'],
-                'graph_snapshot': snapshots['graph'], 'catalog_snapshot': snapshot,
-                'candidate_policy': policy['snapshot']['rules']}, snapshots['graph'], tree_rules=True)
-        binding = query_context(item['case']['query'], catalogs[app]['catalog'])
-        return observed_features(bases[app], graph, binding, indices)
+    items, excluded, tokens = [], [], set()
+    feature = ObservedFeatureBuilder(snapshots, indices)
 
     prior = None
     if args.resume:
@@ -213,6 +196,9 @@ def train(args):
         'epochs': args.epochs, 'mode': args.mode, 'seed': args.seed, 'counts': dict(counts),
         'threads': args.threads, 'width': args.width,
         'runtime': runtime_metadata(device), 'artifact_relocation': args.artifact_root,
+        'input_pipeline': {'workers': args.input_workers, 'cache_mb_total': args.input_cache_mb,
+                           'prefetch_per_worker': args.input_prefetch, 'ordered': True,
+                           'learned_cache': False, 'graph_content_check_on_every_access': True},
         'training_contract': training_contract(args.width, args.mode),
         'queries': items, 'excluded': excluded, 'input_snapshots': snapshots,
         'split': 'family_disjoint_internal_80_20_within_original_train_only',
@@ -242,11 +228,11 @@ def train(args):
             torch.save(best_state, args.output / 'best-validation.pt')
         del saved
 
-    def inputs(item):
-        result = feature(item)
-        result['sequences'] = {k: [encode_sequence(s, vocabulary) for s in v]
-                               for k, v in result['sequences'].items()}
-        return result
+    ordered_items = train + validation
+    dataset = ObservedInputDataset(ordered_items, feature, vocabulary,
+        args.input_cache_mb * 1024 * 1024 // max(1, args.input_workers), args.artifact_root)
+    input_order = []
+    loader = input_loader(dataset, input_order, args.input_workers, args.input_prefetch)
 
     print(json.dumps({'phase': 'training', 'counts': dict(counts), 'targets': TARGETS}), flush=True)
     def log_progress(event):
@@ -257,16 +243,21 @@ def train(args):
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        order = list(train)
+        order = list(range(len(train)))
         random.Random(args.seed + epoch).shuffle(order)
         offset = resume_offset if epoch == start_epoch else 0
         loss_sum = resume_loss_sum if epoch == start_epoch else 0.
         loss_count = resume_loss_count if epoch == start_epoch else 0
-        for item in order[offset:]:
+        input_order[:] = order[offset:]
+        prepared = iter(loader)
+        for expected_index in input_order:
+            item = ordered_items[expected_index]
             begin = time.perf_counter()
             event = {'epoch': epoch + 1, 'steps': steps, 'case_id': item['case']['case_id']}
             log_progress(event | {'phase': 'input'})
-            data = inputs(item)
+            index, data, preparation = next(prepared)
+            if index != expected_index:
+                raise ValueError('input prefetch changed query order')
             loaded = time.perf_counter()
             log_progress(event | {'phase': 'forward', 'input_seconds': loaded - begin,
                 'trees': len(data['history_trees']), 'contexts': len(data['history_contexts']),
@@ -289,7 +280,8 @@ def train(args):
             log_progress(event | {'phase': 'parameter_update', 'steps': steps, 'loss': loss.item(),
                 'input_seconds': loaded - begin, 'forward_seconds': forwarded - loaded,
                 'backward_seconds': backwarded - forwarded,
-                'update_seconds': time.perf_counter() - backwarded})
+                'update_seconds': time.perf_counter() - backwarded,
+                'input_preparation': preparation})
             del data, loss
             if steps == 1 or steps % 10 == 0 or steps % len(train) == 0:
                 temporary = args.output / 'latest.pt.tmp'
@@ -299,17 +291,25 @@ def train(args):
                             **({'cuda_rng_state': torch.cuda.get_rng_state(device)} if device.type == 'cuda' else {}),
                             'best_validation_loss': best, 'best_validation_model': best_state}, temporary)
                 temporary.replace(args.output / 'latest.pt')
+        del prepared
         model.eval()
+        input_order[:] = range(len(train), len(ordered_items))
+        prepared = iter(loader)
         errors, baseline, val_loss = torch.zeros(2, device=device), torch.zeros(2, device=device), 0.
         with torch.inference_mode():
-            for item in validation:
+            for expected_index in input_order:
+                item = ordered_items[expected_index]
                 log_progress({'phase': 'validation', 'epoch': epoch + 1, 'steps': steps,
                               'case_id': item['case']['case_id']})
                 expected = torch.tensor(item['target_log1p_ms'], device=device)
-                predicted = model(inputs(item))
+                index, data, _ = next(prepared)
+                if index != expected_index:
+                    raise ValueError('validation prefetch changed query order')
+                predicted = model(data)
                 val_loss += torch.nn.functional.smooth_l1_loss(predicted, expected).item()
                 errors += (predicted - expected).abs()
                 baseline += (constant - expected).abs()
+        del prepared, data
         val_loss /= len(validation)
         if not math.isfinite(val_loss):
             raise ValueError('nonfinite validation loss')
@@ -327,6 +327,7 @@ def train(args):
         with (args.output / 'learning-curve.jsonl').open('a') as stream:
             stream.write(json.dumps(row) + '\n')
         print(json.dumps(row), flush=True)
+    del loader, dataset
     for snapshot in snapshots.values():
         read_snapshot(snapshot)
     torch.save(model.state_dict(), args.output / 'model.pt')

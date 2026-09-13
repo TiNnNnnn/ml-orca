@@ -1,6 +1,43 @@
 """Current observed graph features, with an explicit retrospective boundary."""
 import math
-from ml_orca.encoding.rule_policy_encoding import category, number
+import gzip
+import json
+from ml_orca.common.artifacts import read_snapshot
+from ml_orca.encoding.query_policy_encoding import query_context
+from ml_orca.encoding.rule_policy_encoding import category, number, input_sequences
+
+
+class ObservedFeatureBuilder:
+    """Parameter-free preparation shared by training, prefetch workers and profiling."""
+
+    def __init__(self, snapshots, rule_indices):
+        self.snapshots, self.rule_indices = snapshots, rule_indices
+        self.catalogs, self.bases = {}, {}
+
+    def __call__(self, item, raw=None):
+        graph = json.loads(gzip.decompress(read_snapshot(item['graph_snapshot']) if raw is None else raw))
+        if graph['case'] != item['case']:
+            raise ValueError('graph/query identity mismatch')
+        app = item['case']['dataset']
+        snapshot = graph['source_files']['context']
+        key = 'catalog:' + app
+        if key in self.snapshots and self.snapshots[key] != snapshot:
+            raise ValueError('observed catalog differs from frozen application context')
+        if app not in self.catalogs:
+            context = json.loads(read_snapshot(snapshot))
+            if not context['capture_input_endpoints_equal'] or context['status'] != 'ok':
+                raise ValueError('invalid catalog capture')
+            policy = context['resolved_policies']['behavior']
+            if policy['status'] != 'ok':
+                raise ValueError('unresolved policy')
+            static = self.snapshots['graph']
+            self.bases[app] = input_sequences({'query_sql': item['case']['query'],
+                'graph_snapshot': static, 'catalog_snapshot': snapshot,
+                'candidate_policy': policy['snapshot']['rules']}, static, tree_rules=True)
+            self.catalogs[app] = context
+            self.snapshots[key] = snapshot
+        binding = query_context(item['case']['query'], self.catalogs[app]['catalog'])
+        return observed_features(self.bases[app], graph, binding, self.rule_indices)
 
 def observed_features(base, graph, binding, rule_indices):
     """No timing/outcome labels enter inputs. Current search state is explicitly retrospective."""
