@@ -9,8 +9,9 @@ import json
 import math
 from pathlib import Path
 
-from ml_orca.trace.profile_rule_candidates import candidate_evidence, candidate_state
+from ml_orca.trace.profile_rule_candidates import candidate_evidence, candidate_state, input_context_features
 from ml_orca.encoding.rule_policy_encoding import category, flag, number
+from ml_orca.common.stats_requests import validate_request_snapshot
 
 
 def group_expression_sequence(state):
@@ -19,7 +20,7 @@ def group_expression_sequence(state):
     flag(out, 'ge:captured', state['captured'])
     if not state['captured']:
         return out
-    if state.get('capture') != 'before_evaluation':
+    if state.get('capture') not in ('before_evaluation', 'before_memo_initialization'):
         raise ValueError('GroupExpression features must precede evaluation')
     features = state['features']
 
@@ -110,17 +111,25 @@ def attempt_samples(run):
     return records
 
 
-def group_expression_tree(state):
+def group_expression_tree(state, catalog_features=None, stats_requests=None):
     """Observed prefix -> ordered postorder tree; omitted children stay unknown.
 
     Only root/direct relational children have cached statistics in trace v1.
     Deeper nodes receive explicit missing attributes, never table/future rows.
+    Optional same-database pre-workload catalog features remain a separate channel;
+    relation OIDs join that snapshot but never become numeric model inputs.
+    Optional native request ordinals join pre-workload configuration, not outcomes.
+    Only directly resolved operators are observed, not all indirect Memo effects.
     """
     group_expression_sequence(state)  # Validate counts, prefix and capture boundary.
     features = state['features']
     tree = features.get('source_tree') if state['captured'] else None
     if tree is None:
         return None
+    requests = None if stats_requests is None else validate_request_snapshot(stats_requests)
+    binding = tree.get('request_binding')
+    if requests is not None and binding not in (None, 'resolved_operator_only'):
+        raise ValueError('unknown stats request binding scope')
     observed = {'r': features['root']}
     observed.update({'r/' + str(c['position']): c['node'] for c in features['children']})
     preorder, stack = [], []
@@ -143,14 +152,94 @@ def group_expression_tree(state):
             raise ValueError('cached node attributes disagree with source tree')
         attrs = attrs or {'operator': node['operator'], 'arity': node['arity'], 'stats_source': 'unobserved',
                           'rows_available': False, 'rows': None}
-        local = {'captured': True, 'capture': 'before_evaluation', 'features': {
+        local = {'captured': True, 'capture': state['capture'], 'features': {
             'root': attrs, 'children': [], 'relational_children': None, 'omitted_children': None}}
         sequence = group_expression_sequence(local)
+        if requests is not None:
+            index = node.get('request_index')
+            known = binding == 'resolved_operator_only' and 'request_index' in node
+            if index is not None and (not known or type(index) is not int or not 0 <= index < len(requests)):
+                raise ValueError('invalid stats request index')
+            request = None if index is None else requests[index]
+            if request is not None and request['expression'] and request['operator'] != node['operator']:
+                raise ValueError('stats request operator disagrees with source tree')
+            flag(sequence, 'ge:request_binding_observed', known)
+            flag(sequence, 'ge:request_direct_target', index is not None if known else None)
+            number(sequence, 'ge:requested_rows', None if request is None else request['requested_rows'], lower=1, log=True)
+            if request is not None:
+                category(sequence, 'ge:request_source', 'declared_config_resolved_operator')
+        if catalog_features is not None:
+            oid = node.get('relation_oid')
+            if oid is not None and (type(oid) is not int or not 0 < oid < 2**32):
+                raise ValueError('invalid catalog relation identity')
+            catalog = catalog_features.get(str(oid)) if oid is not None else None
+            flag(sequence, 'ge:catalog_identity_observed', 'relation_oid' in node)
+            flag(sequence, 'ge:catalog_relation_present', oid is not None)
+            flag(sequence, 'ge:catalog_available', catalog is not None)
+            if catalog is not None:
+                category(sequence, 'ge:catalog_source', 'pre_workload_catalog')
+                sequence.extend(('ge:catalog:' + field, value) for field, value in catalog)
         flag(sequence, 'ge:node_attributes_observed', node['path'] in observed)
         number(sequence, 'ge:unobserved_child_slots', node['arity'] - len(node['children']), lower=0)
         sequences.append(sequence)
         nodes.append({'path': node['path'], 'children': [remap[c] for c in node['children']]})
-    return {'nodes': nodes, 'root': len(nodes) - 1, 'complete': tree['complete'], 'sequences': sequences}
+    result = {'nodes': nodes, 'root': len(nodes) - 1, 'complete': tree['complete'], 'sequences': sequences}
+    if state['capture'] == 'before_memo_initialization':
+        result['capture'] = state['capture']
+    return result
+
+
+def query_input_tree(run, *, catalog_features=None, stats_requests=None):
+    """Audited pre-Memo whole query, not a future candidate or an RBO policy input.
+
+    Its operators are post-preprocessing. This CBO-only gate deliberately rejects
+    preceding DSL attempts, since that input could depend on an RBO policy.
+    """
+    records = run.get('query_input_contexts', [])
+    outcomes = run.get('experiment_outcomes', [])
+    if len(records) != 1 or len(outcomes) > 1:
+        raise ValueError('missing or ambiguous pre-Memo query input')
+    record = records[0]
+    if outcomes and (type(outcomes[0].get('query_input_context_version')) is not int or
+                     outcomes[0]['query_input_context_version'] != 1 or
+                     record.get('experiment') != outcomes[0].get('experiment')):
+        raise ValueError('mismatched pre-Memo query outcome')
+    if (type(record.get('schema_version')) is not int or record['schema_version'] != 1 or
+            not isinstance(record.get('experiment'), str) or not record['experiment'] or
+            any(type(record.get(k)) is not int or record[k] != 0 for k in
+                ('preceding_rule_candidates', 'preceding_cost_candidates', 'preceding_search_checks'))):
+        raise ValueError('query input does not precede the CBO-only experiment')
+    context = record.get('input_context') or {}
+    if (context.get('capture') != 'before_memo_initialization' or
+            context.get('scope') != 'query_after_preprocessing' or
+            type(context.get('stats_lifecycle_sequence')) is not int or context['stats_lifecycle_sequence'] != 0):
+        raise ValueError('invalid pre-Memo query capture boundary')
+    observed = [context.get('root', {}), *[child['node'] for child in context.get('children', [])]]
+    if any(node.get('memo_state') is not None or node.get('memo_group_expressions') is not None or
+           node.get('logical_properties') is not None or node.get('stats_source') == 'memo_group'
+           for node in observed):
+        raise ValueError('pre-Memo query input contains Memo state')
+    if stats_requests is not None:
+        validate_request_snapshot(stats_requests)
+        if stats_requests['experiment'] != record['experiment']:
+            raise ValueError('request snapshot does not belong to query input')
+    state = {'captured': True, 'capture': 'before_memo_initialization',
+             'features': input_context_features(context)}
+    tree = group_expression_tree(state, catalog_features, stats_requests)
+    if tree is None or tree['complete'] is not True:
+        raise ValueError('incomplete pre-Memo query tree')
+    if stats_requests is not None:
+        source = context['source_tree']
+        if source.get('request_binding') != 'resolved_operator_only' or any('request_index' not in n for n in source['nodes']):
+            raise ValueError('missing pre-Memo query request binding')
+        # Initial resolution must account for every declared target, even if
+        # later policy-dependent attempt trees never visit that part of query.
+        if {n['request_index'] for n in source['nodes'] if n['request_index'] is not None} != set(range(len(stats_requests['requests']))):
+            raise ValueError('query tree does not cover all declared requests')
+    tree['scope'] = 'pre_memo_query_root_expression'
+    tree['not_observed'] = ['external_cte_producer_definitions', 'required_physical_properties',
+                            'full_scalar_semantics']
+    return tree
 
 
 def stats_timeline(run):

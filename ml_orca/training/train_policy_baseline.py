@@ -15,7 +15,7 @@ import re
 from statistics import median
 import time
 
-from ml_orca.data.export_policy_learning_samples import export_comparison
+from ml_orca.data.export_policy_learning_samples import export_comparison, policy_runtime_settings
 from ml_orca.common.artifacts import read_snapshot
 from ml_orca.common.paths import package_sources
 from ml_orca.data.export_history_corpus import iter_history_runs
@@ -60,10 +60,7 @@ def measurement_environment(context, comparison, arm):
     runtime = context['settings_sql'][arm]
     if not isinstance(settings, dict) or not settings or not isinstance(runtime, str) or not runtime:
         raise ValueError('missing captured measurement settings')
-    runtime, replaced = re.subn(r"(?m)^SET pg_orca\.dsl_rule_policy_path='(?:''|[^'])*';$",
-                               "SET pg_orca.dsl_rule_policy_path='<encoded_policy>';", runtime)
-    if replaced != 1:
-        raise ValueError('expected one explicitly resolved policy setting')
+    runtime = policy_runtime_settings(runtime)
     return {'artifacts': binaries, 'catalog_settings': settings, 'runtime_settings_sql': runtime,
             'scope': 'captured_software_and_settings_only_not_hardware_or_load_equivalence'}
 

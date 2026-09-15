@@ -4,6 +4,7 @@ import importlib
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 from ml_orca.__main__ import COMMANDS
 from ml_orca.common.paths import ML_ORCA_ROOT, PGORCA_ROOT, TEST_ASSETS, package_sources, source_file
@@ -42,6 +43,14 @@ class ModuleContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             source_file('observed_search.py')  # Encoding and objective are intentionally distinct.
         self.assertEqual(ML_ORCA_ROOT.name, 'ml_orca')
+
+    def test_custom_rule_library_does_not_inherit_builtin_policy(self):
+        from ml_orca.collect.run_workload_comparison import parse_args
+        base = ['run_workload_comparison', '--pg-config=x', '--audit-bin=y']
+        with patch.object(sys, 'argv', base):
+            self.assertIsNotNone(parse_args().policy_file)
+        with patch.object(sys, 'argv', base + ['--rule-file=/tmp/custom.rules']):
+            self.assertIsNone(parse_args().policy_file)
 
     def test_cli_help_from_outside_repository_without_site_packages(self):
         # -S hides optional installed dependencies; the lazy entry point still works.

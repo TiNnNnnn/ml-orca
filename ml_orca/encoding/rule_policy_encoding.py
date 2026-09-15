@@ -297,6 +297,35 @@ def input_sequences(inputs, static_graph_snapshot=None, tree_rules=False):
     return result
 
 
+def pre_memo_input_sequences(inputs, query_context, static_graph_snapshot):
+    """Opt-in post-preprocessing CBO inputs; callers supply a verified native record.
+
+    This later decision point is deliberately not the legacy pre-workload API.
+    Current attempts, costs and final plans are neither accepted nor encoded.
+    """
+    from ml_orca.encoding.group_expression_encoding import query_input_tree
+    if any(row.get('enabled') and row.get('placement') != 'cbo'
+           for row in inputs['candidate_policy']):
+        raise ValueError('pre-Memo features require a fixed CBO-only policy')
+    requests = inputs.get('stats_experiment_requests')
+    if requests is None:
+        raise ValueError('pre-Memo features require the native request snapshot, including empty requests')
+    features = input_sequences(inputs, static_graph_snapshot, tree_rules=True)
+    context = json.loads(read_snapshot(inputs['catalog_snapshot']))
+    catalog, _ = catalog_sequences(context['catalog'])
+    oids = [str(r['oid']) for r in context['catalog']['relations']]
+    if len(set(oids)) != len(oids) or any(not re.fullmatch(r'[1-9][0-9]{0,9}', oid) or int(oid) >= 2**32 for oid in oids):
+        raise ValueError('invalid catalog relation identity')
+    tree = query_input_tree({'query_input_contexts': [query_context]},
+        catalog_features=dict(zip(oids, catalog)), stats_requests=requests)
+    features['sequences']['query_input_node'] = tree.pop('sequences')
+    features['query_input_tree'] = tree
+    features['decision_point'] = 'post_preprocessing_pre_cbo'
+    features['not_encoded'] = [k for k in features['not_encoded'] if k != 'statistics_intervention'] + [
+        'indirect_statistics_propagation', *tree['not_observed']]
+    return features
+
+
 def fit_vocabulary(sequence_groups):
     tokens = sorted({token for groups in sequence_groups for seqs in groups.values() for seq in seqs for token, _ in seq})
     if '<pad>' in tokens or '<unknown>' in tokens:

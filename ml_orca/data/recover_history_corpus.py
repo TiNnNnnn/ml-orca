@@ -65,7 +65,10 @@ def decode(root, case, defer_failed=False):
     with gzip.open(trace, 'rt', errors='replace') as stream:
         text = stream.read()
     run = trace_run(text, rc, fallback)
-    result = summarize_trace(text, rc, fallback, required_binding_version=3,
+    version = json.loads(sources['manifest'].read_text()).get('required_binding_edge_trace_version', 3)
+    if type(version) is not int or version not in (3, 4):
+        raise ValueError('unsupported frozen binding edge trace version')
+    result = summarize_trace(text, rc, fallback, required_binding_version=version,
                              require_stats=True, run=run)
     # Do not duplicate per-event state in batch reports; original lossless trace stays intact.
     keys = ('complete', 'exclusions', 'stats_timeline_complete', 'candidate_complete',

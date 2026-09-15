@@ -28,15 +28,8 @@ STAGES = {
 TIMES = ("match_us", "constraint_us", "instantiate_us")
 
 
-def candidate_state(row: dict) -> dict:
-    """Partial pre-evaluation observation, not a sufficient/Markov state or an identity."""
-    context = row.get("input_context") or {}
-    captured = (row.get("evaluated") is True and not row.get("context_resolution_errors")
-                and context.get("capture") == "before_evaluation"
-                and context.get("scope") == "source_before_match_view")
-    if not captured:
-        context = {}
-
+def input_context_features(context: dict) -> dict:
+    """Normalize cached attributes; the caller must audit the capture stage."""
     def node(value):
         source = value.get("stats_source", "unknown")
         rows = value.get("rows")
@@ -57,13 +50,24 @@ def candidate_state(row: dict) -> dict:
                 "empty": value.get("empty") if source in {"expression", "memo_group"} else None}
 
     children = context.get("children", [])
+    return {"root": node(context.get("root", {})),
+            "children": [{"position": c["position"], "node": node(c["node"])} for c in children],
+            "source_shape": context.get("source_shape"), "source_tree": context.get("source_tree"),
+            "relational_children": context.get("relational_children"),
+            "omitted_children": context.get("omitted_children")}
+
+
+def candidate_state(row: dict) -> dict:
+    """Partial pre-evaluation observation, not a sufficient/Markov state or an identity."""
+    context = row.get("input_context") or {}
+    captured = (row.get("evaluated") is True and not row.get("context_resolution_errors")
+                and context.get("capture") == "before_evaluation"
+                and context.get("scope") == "source_before_match_view")
+    if not captured:
+        context = {}
+    children = context.get("children", [])
     return {"capture": "before_evaluation", "captured": bool(captured),
-            "features": {"root": node(context.get("root", {})),
-                         "children": [{"position": c["position"], "node": node(c["node"])} for c in children],
-                         "source_shape": context.get("source_shape"),
-                         "source_tree": context.get("source_tree"),
-                         "relational_children": context.get("relational_children"),
-                         "omitted_children": context.get("omitted_children")},
+            "features": input_context_features(context),
             # Run identity is supplied by the surrounding report. Never pool these IDs as features.
             "provenance": {**{key: row.get(key) for key in (
                 "experiment", "sequence", "rule_hash", "group", "group_expression", "memo_version",
@@ -242,7 +246,7 @@ def binding_origin_evidence(run: dict) -> dict:
     finals = run.get("experiment_outcomes", [])
     final = finals[0] if len(finals) == 1 else {}
     version = final.get("binding_edge_trace_version")
-    if version not in (1, 2, 3):
+    if version not in (1, 2, 3, 4):
         problems.append("binding_edge_trace_version_missing")
     edges = run.get("rule_edges")
     if not isinstance(edges, list):
@@ -274,26 +278,36 @@ def binding_origin_evidence(run: dict) -> dict:
                 or edge.get("relation") != (relation if candidate.get("status") == "ready_cbo" else "binding_observed")):
             problems.append("invalid_binding_edge_relation")
         producer_outcomes = {"memo_inserted", "memo_duplicate"}
-        if version == 3:
+        if version in (3, 4):
             producer_outcomes.add("memo_rehashed")
-        if version in (2, 3) and edge.get("producer_outcome") not in producer_outcomes:
+        if version in (2, 3, 4) and edge.get("producer_outcome") not in producer_outcomes:
             problems.append("invalid_binding_producer_outcome")
         identity = (edge.get("dst_candidate_sequence"), path)
-        if version in (2, 3):
+        if version in (2, 3, 4):
             identity += (edge.get("src_rule"), edge.get("src_target_path"), relation,
                          edge.get("producer_outcome"))
+        if version == 4:
+            seq = edge.get('src_candidate_sequence')
+            source = candidates.get(seq, {})
+            dst = edge.get('dst_candidate_sequence')
+            if (type(seq) is not int or type(dst) is not int or not 0 < seq < dst
+                    or source.get('rule_hash') != edge.get('src_rule')
+                    or source.get('evaluated') is not True or source.get('status') != 'ready_cbo'):
+                problems.append('unresolved_binding_edge_producer_instance')
+            identity += (seq,)
         if identity in observed:
             problems.append("duplicate_binding_position")
         observed.add(identity)
     return {"complete": not problems, "exclusions": sorted(set(problems)), "edges": edges,
-            "producer_coverage": ("observed_before_binding_including_memo_duplicates_and_rehash" if version == 3 else
+            "producer_instance_coverage": "validated_source_attempts" if version == 4 else "unavailable",
+            "producer_coverage": ("observed_before_binding_including_memo_duplicates_and_rehash" if version in (3, 4) else
                                   "observed_before_binding_including_memo_duplicates" if version == 2 else "first_inserter_only"),
             "scope": "direct_DSL_origins_in_extracted_CBO_bindings_including_failed_evaluations",
             "not_included": ["unbound_memo_alternatives", "template_path_mapping", "all_causal_enablers",
                              "transitive_native_xform_origins",
                              "producers_observed_after_binding"] +
-                            (["origins_coalesced_by_later_group_rehash"] if version != 3 else []) +
-                            (["duplicate_candidate_producers"] if version not in (2, 3) else [])}
+                            (["origins_coalesced_by_later_group_rehash"] if version not in (3, 4) else []) +
+                            (["duplicate_candidate_producers"] if version not in (2, 3, 4) else [])}
 
 
 def cost_evidence(run: dict) -> dict:
@@ -1238,16 +1252,23 @@ def render_cbo_contribution(report: dict, output: Path, font: Path) -> None:
     for axis, field, title in zip(axes[0], ("delta_planning_ms", "delta_execution_ms"), ("规划时间的条件贡献", "执行时间的条件贡献")):
         for factor in factors:
             selected = [r for r in rows if r["factors"] == [factor]]
-            values = [(r["family_weight"], [p[field] for p in r["pairs"] if p[field] is not None]) for r in selected]
+            values = [(r.get("family_weight", 1.0), [p[field] for p in r["pairs"] if p[field] is not None])
+                      for r in selected]
             axis.scatter([factor for _, vs in values for _ in vs], [v for _, vs in values for v in vs], alpha=0.35)
             means = [(w, sum(vs) / len(vs)) for w, vs in values if vs]
             if means:
                 axis.scatter(factor, sum(w * v for w, v in means) / sum(w for w, _ in means), marker="_", s=180, color="#ee7733")
         axis.set(title=title, ylabel="开启 − 关闭（毫秒）；负值为降低")
         axis.axhline(0, color="gray", linewidth=0.7)
-    valid = [r for r in rows if r["delta"] is not None]
-    axes[1, 0].scatter([r["factors"][0] for r in valid], [r["delta"]["memo_expressions"] for r in valid], alpha=0.5)
-    axes[1, 0].set(title="完整同优化器对照下的搜索空间贡献", ylabel="开启 − 关闭的表达式数量")
+    valid = sorted((r for r in rows if r["delta"] is not None), key=lambda r: r["factors"][0])
+    xs = [r["factors"][0] for r in valid]
+    axes[1, 0].scatter(xs, [r["delta"]["memo_expressions"] for r in valid],
+                       color="#4477aa", label="表达式净增")
+    cost_axis = axes[1, 0].twinx()
+    cost_axis.plot(xs, [-r["delta"]["optimizer_cost"] for r in valid],
+                   "o-", color="#cc3311", label="估算成本降低")
+    axes[1, 0].set(title="搜索空间与终止计划成本收益", ylabel="开启 − 关闭的表达式数量")
+    cost_axis.set_ylabel("关闭 − 开启的估算计划成本；正值为改善", color="#cc3311")
     bottom = [0] * len(factors)
     for kind, label in (("ok", "诊断可比"), ("fallback", "关闭回退，开启正常"), ("other", "其他不可比或未运行")):
         def category(r):
@@ -1288,8 +1309,9 @@ def render_search_contribution(report: dict, output: Path, font: Path) -> None:
                ("lifecycle:best_updated", "更新当前最优"), ("selected_distinct_candidates", "最终采用的去重成本候选"))
     valid = [r for r in report["runs"] if (r.get("search") or {}).get("complete")]
     for axis, (field, label) in zip(axes.flat, metrics):
-        for query in sorted({r["query"] for r in valid}):
-            rows = sorted((r for r in valid if r["query"] == query), key=lambda r: r["factors"][0])
+        for query in sorted({r.get("query", "单查询") for r in valid}):
+            rows = sorted((r for r in valid if r.get("query", "单查询") == query),
+                          key=lambda r: r["factors"][0])
             axis.plot([r["factors"][0] for r in rows], [r["search"]["delta"].get(field, 0) for r in rows],
                       "o--", label=query, alpha=0.75)
         axis.axhline(0, color="gray", linewidth=0.7)
@@ -1741,7 +1763,7 @@ def main() -> None:
     parser.add_argument("--cohort", type=Path, help="frozen discovery sample, keeping failed/missing members")
     parser.add_argument("--sweep-suite", type=Path, help="fixed-cohort cardinality sweep suite.json")
     parser.add_argument("--sweep-manifest", type=Path, help="single-query one/joint-input manifest with --comparison")
-    parser.add_argument("--cbo-contribution", help="with --sweep-suite, compare this rule's OFF/CBO-only timing and feasibility")
+    parser.add_argument("--cbo-contribution", help="with --sweep-suite or --sweep-manifest, compare this rule's OFF/CBO-only contribution")
     parser.add_argument("--results", type=Path, help="one runner batch directory for cohort analysis")
     parser.add_argument("--experiment-index", type=int, default=1, help="1-based pure-observation experiment in a batch")
     parser.add_argument("--scenario", type=int, default=1)
@@ -1753,10 +1775,25 @@ def main() -> None:
     args = parser.parse_args()
     if args.sweep_manifest:
         if not args.comparison or any((args.results, args.cohort, args.sweep_suite, args.parameter_manifest,
-                                       args.cbo_contribution, args.shape_view, args.cost_view, args.rule_hash)):
-            parser.error("--sweep-manifest requires only --comparison")
+                                       args.shape_view, args.cost_view, args.rule_hash)):
+            parser.error("--sweep-manifest requires --comparison and optionally --cbo-contribution")
         manifest = json.loads(args.sweep_manifest.read_text())
         comparison = json.loads(args.comparison.read_text())
+        if args.cbo_contribution:
+            rule_hash = comparison.get("rule_profile", {}).get("rule_hash")
+            if args.cbo_contribution != rule_hash:
+                parser.error("--cbo-contribution must name the comparison's profiled rule")
+            report = {"scope": "single_query_cardinality_cbo_minus_off_not_generalization",
+                      "rule_hash": rule_hash,
+                      "runs": cbo_contribution(manifest, comparison, args.sweep_manifest.parent,
+                                                args.comparison.parent)}
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
+            render_cbo_contribution(report, args.output, args.font)
+            render_search_contribution(report, args.output.with_name(args.output.name + "-search"), args.font)
+            print(json.dumps({"points": len(report["runs"]),
+                              "comparable": sum(row["delta"] is not None for row in report["runs"])}))
+            return
         points = sweep_candidate_evidence(manifest, comparison, args.sweep_manifest.parent, args.comparison.parent)
         report = {"source": str(args.comparison.resolve()), "query_crc32": comparison["query_crc32"],
                   "manifest": str(args.sweep_manifest.resolve()), "targets": manifest["targets"], "points": points,

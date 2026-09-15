@@ -8,20 +8,24 @@ from ml_orca.models.message_passing import DirectedRuleAggregation
 
 
 class WholePolicyPredictor(nn.Module):
-    """Shared set/static-graph models, predicting log1p milliseconds for planning/execution.
+    """Shared set/static-graph model; the caller declares the output objective.
 
+    The default two channels retain the legacy planning/execution model layout.
+    Explicit output_size changes require a separate checkpoint/objective contract.
     Only prospective rule/policy/query/catalog channels are read. Current Memo,
     historical edges/counts, and response labels are intentionally not inputs.
     """
 
-    def __init__(self, vocabulary_size, width=32, graph_mode='none'):
+    def __init__(self, vocabulary_size, width=32, graph_mode='none', output_size=2):
         super().__init__()
         if graph_mode not in ('none', 'static', 'self'):
             raise ValueError('unsupported graph ablation')
+        if type(output_size) is not int or output_size < 1:
+            raise ValueError('positive output size required')
         self.graph_mode = graph_mode
         self.encoder = SharedSequenceEncoder(vocabulary_size, width)
         self.rule_context = nn.Sequential(nn.Linear(3 * width, width), nn.Tanh())
-        self.readout = nn.Sequential(nn.Linear(2 * width + 1, width), nn.Tanh(), nn.Linear(width, 2))
+        self.readout = nn.Sequential(nn.Linear(2 * width + 1, width), nn.Tanh(), nn.Linear(width, output_size))
         # Registered after baseline parameters, preserving their initialization.
         if graph_mode != 'none':
             self.messages = DirectedRuleAggregation(width)

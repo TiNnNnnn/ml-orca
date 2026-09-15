@@ -29,6 +29,53 @@ def attempt_fixture():
 
 
 class GroupExpressionEncodingTest(unittest.TestCase):
+    def test_global_query_input_retains_external_request_without_future_statistics(self):
+        from ml_orca.encoding.group_expression_encoding import query_input_tree
+        row = attempt_fixture()
+        context = row['input_context']
+        context.update(capture='before_memo_initialization', scope='query_after_preprocessing', stats_lifecycle_sequence=0)
+        for node in [context['root'], *[c['node'] for c in context['children']]]:
+            node.update(memo_state=None, memo_group_expressions=None, stats_source='expression')
+        context['children'][0]['node'].update(operator='CLogicalSelect', arity=2)
+        source = context['source_tree']
+        source['request_binding'] = 'resolved_operator_only'
+        for node in source['nodes']:
+            node['request_index'] = None
+        source['nodes'][2]['request_index'] = 0
+        record = {'schema_version': 1, 'experiment': 'q', 'preceding_rule_candidates': 0,
+                  'preceding_cost_candidates': 0, 'preceding_search_checks': 0, 'input_context': context}
+        run = {'query_input_contexts': [record], 'experiment_outcomes': [{'experiment': 'q', 'query_input_context_version': 1}]}
+        request = {'schema_version': 1, 'scope': 'native_stats_requests_not_runtime_resolution',
+                   'experiment': 'q', 'discover': False, 'requests': [
+                       {'relations': [], 'expression': 'a'*16, 'operator': 'CLogicalGet', 'requested_rows': 6}]}
+        tree = query_input_tree(run, stats_requests=request)
+        self.assertEqual(tree['capture'], 'before_memo_initialization')
+        self.assertEqual([n['path'] for n, s in zip(tree['nodes'], tree['sequences'])
+                          if ('ge:request_direct_target', 1) in s], ['r/0/0'])
+        changed = deepcopy(request)
+        changed['requests'][0]['requested_rows'] = 1536
+        self.assertNotEqual(query_input_tree(run, stats_requests=changed), tree)
+        run.update(candidate_events=[{'future': 999}], cost_events=[{'cost': 1}],
+                   stats_lifecycle_events=[{'rows': 99999}], final_plan={'operator': 'different'})
+        self.assertEqual(query_input_tree(run, stats_requests=request), tree)
+        timed_out = deepcopy(run)
+        timed_out.update(experiment_outcomes=[], plan_rc=124)
+        self.assertEqual(query_input_tree(timed_out, stats_requests=request), tree)
+        for field in ('preceding_rule_candidates', 'preceding_cost_candidates', 'preceding_search_checks'):
+            invalid = deepcopy(run)
+            invalid['query_input_contexts'][0][field] = 1
+            with self.assertRaisesRegex(ValueError, 'does not precede'):
+                query_input_tree(invalid, stats_requests=request)
+        for mutate in (lambda r: r.update(query_input_contexts=[]),
+                       lambda r: r['query_input_contexts'].append(record),
+                       lambda r: r['query_input_contexts'][0]['input_context'].update(capture='after_search'),
+                       lambda r: r['query_input_contexts'][0]['input_context']['root'].update(memo_state={'group': 1}),
+                       lambda r: r['query_input_contexts'][0]['input_context']['source_tree']['nodes'][2].update(request_index=None)):
+            invalid = deepcopy(run)
+            mutate(invalid)
+            with self.assertRaises(ValueError):
+                query_input_tree(invalid, stats_requests=request)
+
     def timeline_fixture(self):
         rows = []
         for sequence, cutoff in enumerate((0, 2, 3), 1):

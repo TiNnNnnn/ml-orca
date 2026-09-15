@@ -19,20 +19,25 @@ from ml_orca.experiments.plot_stats_sweep import chinese_plotting
 from ml_orca.trace.profile_rule_candidates import (binding_origin_evidence, candidate_evidence, post_search_evidence,
                                      state_coverage, STAGES)
 from ml_orca.collect.run_dphyper_stability import imported_cases
-from ml_orca.collect.run_trace_corpus import render_trace_query, orca_fallback_reason
+from ml_orca.collect.run_trace_corpus import parameter_count, render_trace_query, orca_fallback_reason
 from ml_orca.common.artifacts import artifact_snapshot
 from ml_orca.collect.run_workload_comparison import dsl_observability, inventory, trace_records
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def select_cases(root, count, seed, offset=0):
+def select_cases(root, count, seed, offset=0, parameter_free=False):
     datasets = []
     for path in sorted(root.glob('*/cases.sql')):
         cases = imported_cases(path.parent.name, path)
+        source_population = len(cases)
+        if parameter_free:
+            cases = [(key, sql) for key, sql in cases if parameter_count(sql) == 0]
         rng = random.Random(f'{seed}:{path.parent.name}')
         rng.shuffle(cases)
         datasets.append({'dataset': path.parent.name, 'population': len(cases),
+                         'source_population': source_population,
+                         'excluded_parameterized': source_population - len(cases),
                          'schema_crc32': f'{zlib.crc32((path.parent / "schema.sql").read_bytes()):08x}',
                          'cases': [{'case_id': key, 'query': sql,
                                     'query_crc32': f'{zlib.crc32(sql.encode()):08x}'}
@@ -118,6 +123,7 @@ def trace_run(text, rc, fallback):
            'rule_edges': [r for r in records if r['kind'] == 'rule_edge'],
            'cost_events': [r for r in records if r['kind'] == 'cost_candidate'],
            'cost_lifecycle_events': [r for r in records if r['kind'] == 'cost_lifecycle'],
+           'optimizer_progress': [r for r in records if r['kind'] == 'optimizer_progress'],
            'stats_lifecycle_events': [r for r in records if r['kind'] == 'group_stats_lifecycle'],
            'experiment_outcomes': [r for r in records if r['kind'] == 'experiment_outcome'],
            'dsl_observability': dsl_observability(records)}
@@ -217,7 +223,7 @@ def run_dataset(args, item, index, disabled):
             try:
                 rc, fallback = int(statuses.get(stem, 1)), orca_fallback_reason(path)
                 run = trace_run(text, rc, fallback)
-                result.update(summarize_trace(text, rc, fallback, required_binding_version=3,
+                result.update(summarize_trace(text, rc, fallback, required_binding_version=4,
                                               require_stats=bool(args.history_split), run=run))
                 if args.history_split and result['complete']:
                     from ml_orca.encoding.rule_history_encoding import encode_observations
@@ -307,6 +313,8 @@ def main():
     parser.add_argument('--export-only', action='store_true', help='export selected SQL/schema for the workload comparator; do not start PostgreSQL')
     parser.add_argument('--schema-domain', choices=('wetune', 'base'), default='wetune',
                         help='export-only: base omits appended WeTune schema patches, never original DDL constraints')
+    parser.add_argument('--parameter-free', action='store_true',
+                        help='sample from SQL without unbound $n parameters; use for directly executed exports')
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--jobs', type=int, default=4)
     parser.add_argument('--base-port', type=int, default=60600)
@@ -323,7 +331,7 @@ def main():
     if args.history_split and (args.case or args.offset or args.per_dataset != 0):
         parser.error('--history-split requires --per-dataset 0, no --case and no --offset')
     items = select_cases(args.corpus_dir, 0 if args.case else args.per_dataset,
-                         args.seed, 0 if args.case else args.offset)
+                         args.seed, 0 if args.case else args.offset, args.parameter_free)
     if args.case:
         wanted = set(args.case)
         available = {r['case_id'] for d in items for r in d['cases']}
@@ -344,6 +352,7 @@ def main():
     disabled, _, _, _ = inventory(args)
     manifest = {'sampling': 'uniform_without_replacement_within_application_no_sql_dedup',
                 'seed': args.seed, 'per_dataset': args.per_dataset, 'offset': args.offset, 'datasets': items,
+                'parameter_domain': 'parameter_free' if args.parameter_free else 'generic_or_parameter_free',
                 'rule_crc32': f'{zlib.crc32(args.rules.read_bytes()):08x}',
                 'rules': str(args.rules.resolve()), 'disabled_xforms': disabled,
                 'scope': 'all_dispatched_cbo_attempts_not_final_plan; planning_only_empty_tables',
@@ -375,7 +384,7 @@ def main():
         manifest['artifact_start'] = artifact_snapshot(artifacts)
         if any('error' in v for v in manifest['artifact_start'].values()):
             raise ValueError('cannot fingerprint collection inputs')
-        manifest.update(required_binding_edge_trace_version=3,
+        manifest.update(required_binding_edge_trace_version=4,
                         completeness_scope='candidate_and_binding_origin_streams',
                         dphyper_pair_budget=100, dphyper_edge_budget=100000)
     (args.output / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')

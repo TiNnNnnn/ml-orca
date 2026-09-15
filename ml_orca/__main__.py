@@ -12,6 +12,7 @@ COMMANDS = {
     'trace-corpus': 'collect.run_trace_corpus',
     'compare-workload': 'collect.run_workload_comparison',
     'audit': 'data.audit_history_corpus',
+    'audit-utility': 'trace.audit_rule_utility',
     'recover': 'data.recover_history_corpus',
     'export-history': 'data.export_history_corpus',
     'export-policy': 'data.export_policy_learning_samples',

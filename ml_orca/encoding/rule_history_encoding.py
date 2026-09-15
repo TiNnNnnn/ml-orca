@@ -17,7 +17,7 @@ import re
 from ml_orca.data.export_policy_learning_samples import export_comparison, read_snapshot
 from ml_orca.encoding.group_expression_encoding import group_expression_tree, stats_timeline
 from ml_orca.trace.profile_rule_candidates import binding_origin_evidence, candidate_evidence, candidate_state
-from ml_orca.encoding.rule_policy_encoding import category, flag, input_sequences, number
+from ml_orca.encoding.rule_policy_encoding import catalog_sequences, category, flag, input_sequences, number
 from ml_orca.common.artifacts import artifact_snapshot
 
 
@@ -39,22 +39,40 @@ def freeze_run(snapshot, scenario, arm):
     document = record['inputs']['stats_experiment_document']
     if document is None or document.strip() != 'experiment: rule-input-observation\ndiscover: true\ncardinalities:':
         raise ValueError('history currently requires the read-only input observation experiment')
-    encoded = encode_observations(run)
+    context = json.loads(read_snapshot(record['inputs']['catalog_snapshot']))
+    encoded = encode_observations(run, context['catalog'], record['inputs'].get('stats_experiment_requests'))
     # Read twice to detect changes during parsing; never infer time from file mtime.
     read_snapshot(snapshot)
     return {'source': snapshot, 'unit': record['unit'], 'inputs': record['inputs'], **encoded}
 
 
-def encode_observations(run):
+def encode_observations(run, catalog=None, stats_requests=None):
     """Shared lossless rooted GE/edge encoding for both policy and corpus captures."""
+    if stats_requests is not None:
+        from ml_orca.common.stats_requests import validate_request_snapshot
+        validate_request_snapshot(stats_requests)
     audit, origins, timeline = candidate_evidence(run), binding_origin_evidence(run), stats_timeline(run)
     if not all(a['complete'] for a in (audit, origins, timeline)):
         raise ValueError('incomplete history evidence: ' + str([a['exclusions'] for a in (audit, origins, timeline)]))
+    if stats_requests is not None and (len(run.get('experiment_outcomes', [])) != 1 or
+            run['experiment_outcomes'][0].get('experiment') != stats_requests['experiment']):
+        raise ValueError('request snapshot does not belong to this experiment')
+    catalog_features = None
+    if catalog is not None:
+        # Caller must verify same-database pre-workload snapshot provenance.
+        oids = [str(r['oid']) for r in catalog['relations']]
+        if (len(set(oids)) != len(oids) or
+                any(not re.fullmatch(r'[1-9][0-9]{0,9}', oid) or int(oid) >= 2**32 for oid in oids)):
+            raise ValueError('invalid catalog relation identity')
+        sequences, _ = catalog_sequences(catalog)
+        catalog_features = dict(zip(oids, sequences))
+    instance_origins = origins.get('producer_instance_coverage') == 'validated_source_attempts'
+    instances = []
     trees, contexts, lookup, attempts, mapping, excluded = [], [], {}, {}, {}, Counter()
     for row in audit['rows']:
         state = candidate_state(row)
         try:
-            tree = group_expression_tree(state)
+            tree = group_expression_tree(state, catalog_features=catalog_features, stats_requests=stats_requests)
         except (KeyError, ValueError, TypeError) as error:
             tree = None
             excluded['invalid_context:' + str(error)] += 1
@@ -71,6 +89,9 @@ def encode_observations(run):
             contexts.append({'rule_hash': row['rule_hash'], 'tree': tree_index, 'attempts': 0})
         contexts[attempts[identity]]['attempts'] += 1
         mapping[row['sequence']] = tree_index
+        if instance_origins:
+            instances.append({'sequence': row['sequence'], 'rule_hash': row['rule_hash'],
+                              'tree': tree_index, 'context': attempts[identity], 'status': row['status']})
     edges = []
     for edge in origins['edges']:
         tree_index = mapping[edge['dst_candidate_sequence']]
@@ -83,9 +104,13 @@ def encode_observations(run):
         edges.append({k: edge[k] for k in ('src_rule', 'dst_rule', 'src_target_path',
             'dst_binding_path', 'producer_relation', 'producer_outcome')} | {
                 'tree': tree_index, 'root': nodes[path]})
+        if instance_origins:
+            edges[-1].update({k: edge[k] for k in ('src_candidate_sequence', 'dst_candidate_sequence')})
     return {'trees': trees, 'contexts': contexts, 'edges': edges,
             'denominators': {'attempts': len(audit['rows']), 'observed_edges': len(origins['edges']),
-                             'admitted_edges': len(edges), 'exclusions': dict(excluded)}}
+                             'admitted_edges': len(edges), 'exclusions': dict(excluded)},
+            # Run-local joins for delayed labels, never numeric neural features.
+            **({'instances': instances, 'instance_provenance_version': 1} if instance_origins else {})}
 
 
 def attach_history(features, bundle, static_snapshot, prediction_at, allowed_queries):

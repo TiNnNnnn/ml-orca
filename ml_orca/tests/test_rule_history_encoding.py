@@ -8,9 +8,9 @@ from unittest.mock import patch
 from ml_orca.encoding.group_expression_encoding import group_expression_tree
 from ml_orca.trace.profile_rule_candidates import candidate_state
 from ml_orca.encoding.rule_history_encoding import attach_history
-from ml_orca.encoding.rule_policy_encoding import encode_sequence, fit_vocabulary
+from ml_orca.encoding.rule_policy_encoding import catalog_sequences, encode_sequence, fit_vocabulary
 from ml_orca.tests.test_group_expression_encoding import attempt_fixture
-from ml_orca.tests.test_rule_policy_encoding import ir_fixture
+from ml_orca.tests.test_rule_policy_encoding import catalog_fixture, ir_fixture
 from ml_orca.tests.test_rule_tree_model import tree_features, torch
 
 
@@ -47,6 +47,123 @@ def attach(feature, bundle, timestamp='2026-09-12T11:00:00+00:00', allowed=None)
 
 
 class RuleHistoryEncodingTest(unittest.TestCase):
+    def test_requested_rows_bind_to_actual_positions_without_identity_features_or_stat_backfill(self):
+        import math
+        row = attempt_fixture()
+        row['input_context']['children'][0]['node'].update(operator='CLogicalSelect', arity=2)
+        source = row['input_context']['source_tree']
+        source['request_binding'] = 'resolved_operator_only'
+        for node in source['nodes']:
+            node['request_index'] = None
+        source['nodes'][2]['request_index'] = 0
+        source['nodes'][4]['request_index'] = 1
+        snapshot = {'schema_version': 1, 'scope': 'native_stats_requests_not_runtime_resolution',
+            'experiment': 'private', 'discover': True, 'requests': [
+                {'relations': [], 'expression': 'a'*16, 'operator': 'CLogicalGet', 'requested_rows': 6},
+                {'relations': ['private_alias'], 'expression': '', 'operator': '', 'requested_rows': 192}]}
+        encode = lambda r, s: group_expression_tree(candidate_state(r), stats_requests=s)
+        tree = encode(row, snapshot)
+        nodes = {n['path']: s for n, s in zip(tree['nodes'], tree['sequences'])}
+        self.assertIn(('ge:requested_rows', math.log1p(6)), nodes['r/0/0'])
+        self.assertIn(('ge:rows', None), nodes['r/0/0'])
+        self.assertIn(('ge:requested_rows', math.log1p(192)), nodes['r/1'])
+        self.assertIn(('ge:rows', math.log1p(100)), nodes['r/1'])
+        self.assertIn(('ge:request_direct_target', 0), nodes['r'])
+        self.assertIn(('ge:request_binding_observed', 1), nodes['r'])
+        renamed, reorder = deepcopy(row), deepcopy(snapshot)
+        reorder['requests'].reverse()
+        reorder['experiment'] = 'different'
+        reorder['requests'][0]['relations'] = ['renamed']
+        reorder['requests'][1]['expression'] = 'b'*16
+        renamed['input_context']['source_tree']['nodes'][2]['request_index'] = 1
+        renamed['input_context']['source_tree']['nodes'][4]['request_index'] = 0
+        self.assertEqual(encode(renamed, reorder), tree)
+        more = deepcopy(snapshot)
+        more['requests'][0]['requested_rows'] = 1536
+        larger = encode(row, more)
+        self.assertNotEqual(larger, tree)
+        self.assertEqual([[v for v in s if v[0] != 'ge:requested_rows'] for s in tree['sequences']],
+                         [[v for v in s if v[0] != 'ge:requested_rows'] for s in larger['sequences']])
+        self.assertFalse(any(any(k in field for k in ('index', 'private', 'a'*16))
+                             for seq in tree['sequences'] for field, _ in seq))
+        legacy = deepcopy(row)
+        legacy['input_context']['source_tree'].pop('request_binding')
+        for node in legacy['input_context']['source_tree']['nodes']:
+            node.pop('request_index')
+        unknown = encode(legacy, snapshot)
+        self.assertTrue(all(('ge:request_binding_observed', 0) in s and
+                            ('ge:request_direct_target', None) in s for s in unknown['sequences']))
+        for index in (True, -1, 2, '0'):
+            bad = deepcopy(row)
+            bad['input_context']['source_tree']['nodes'][2]['request_index'] = index
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, 'request index'):
+                encode(bad, snapshot)
+        wrong_operator = deepcopy(snapshot)
+        wrong_operator['requests'][0]['operator'] = 'CLogicalSelect'
+        with self.assertRaisesRegex(ValueError, 'operator disagrees'):
+            encode(row, wrong_operator)
+        for rows in (0, True, float('nan'), float('inf'), 10**1000):
+            invalid = deepcopy(snapshot)
+            invalid['requests'][0]['requested_rows'] = rows
+            with self.assertRaises(ValueError):
+                encode(row, invalid)
+        from ml_orca.encoding.rule_history_encoding import encode_observations
+        with patch('ml_orca.encoding.rule_history_encoding.candidate_evidence', return_value={'complete': True}), \
+             patch('ml_orca.encoding.rule_history_encoding.binding_origin_evidence', return_value={'complete': True}), \
+             patch('ml_orca.encoding.rule_history_encoding.stats_timeline', return_value={'complete': True}), \
+             self.assertRaisesRegex(ValueError, 'does not belong'):
+            encode_observations({'experiment_outcomes': [{'experiment': 'different'}]}, stats_requests=snapshot)
+
+    def test_catalog_features_bind_at_tree_positions_without_backfilling_rows_or_oid_embeddings(self):
+        row = attempt_fixture()
+        row['input_context']['children'][0]['node'].update(operator='CLogicalSelect', arity=2)
+        entries = row['input_context']['source_tree']['nodes']
+        entries[2]['relation_oid'] = 1
+        entries[4]['relation_oid'] = 2
+        catalog = catalog_fixture()
+
+        def encode(value, snapshot):
+            sequences, _ = catalog_sequences(snapshot)
+            return group_expression_tree(candidate_state(value),
+                dict(zip((str(r['oid']) for r in snapshot['relations']), sequences)))
+
+        tree = encode(row, catalog)
+        nodes = {n['path']: s for n, s in zip(tree['nodes'], tree['sequences'])}
+        self.assertIn(('ge:catalog_available', 1), nodes['r/0/0'])
+        self.assertIn(('ge:catalog:estimated_rows', None), nodes['r/0/0'])
+        self.assertIn(('ge:catalog:estimated_rows', 0), nodes['r/1'])
+        self.assertIn(('ge:rows', None), nodes['r/0/0'])  # Never replace missing derived stats.
+        self.assertIn(('ge:catalog_available', 0), nodes['r'])
+        self.assertFalse(any('oid' in field for sequence in tree['sequences'] for field, _ in sequence))
+        more_rows = deepcopy(catalog)
+        more_rows['relations'][0]['estimated_rows'] = 96
+        larger = encode(row, more_rows)
+        self.assertNotEqual(larger, tree)
+        self.assertEqual([[t for t in s if not t[0].startswith('ge:catalog')] for s in larger['sequences']],
+                         [[t for t in s if not t[0].startswith('ge:catalog')] for s in tree['sequences']])
+        renamed, changed = deepcopy(row), deepcopy(catalog)
+        renamed['input_context']['source_tree']['nodes'][2]['relation_oid'] = 101
+        for relation in changed['relations']:
+            if relation['oid'] == '1': relation.update(oid='101', name='renamed')
+        for field in ('columns', 'statistics', 'constraints'):
+            for item in changed[field]:
+                if item['relation_oid'] == '1': item['relation_oid'] = '101'
+        changed['relations'].reverse()
+        self.assertEqual(encode(renamed, changed), tree)
+        for oid in (True, 0, -1, 2**32, '1'):
+            bad = deepcopy(row)
+            bad['input_context']['source_tree']['nodes'][2]['relation_oid'] = oid
+            with self.subTest(oid=oid), self.assertRaisesRegex(ValueError, 'relation identity'):
+                encode(bad, catalog)
+        entries[2]['relation_oid'] = 999
+        missing = encode(row, catalog)
+        self.assertIn(('ge:catalog_available', 0), missing['sequences'][next(
+            i for i, n in enumerate(missing['nodes']) if n['path'] == 'r/0/0')])
+        del entries[2]['relation_oid']
+        legacy = encode(row, catalog)
+        self.assertIn(('ge:catalog_identity_observed', 0), legacy['sequences'][next(
+            i for i, n in enumerate(legacy['nodes']) if n['path'] == 'r/0/0')])
+
     def test_training_minimum_counts_complete_dynamic_queries_and_rejects_leakage(self):
         from ml_orca.training.train_policy_baseline import history_training_gate
         run = {'unit': {'workload': 'app', 'query': '1.sql'},

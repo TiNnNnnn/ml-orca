@@ -65,6 +65,118 @@ ORCA trace / catalog / rule DSL
 `ObservedSearchPredictor` 复用树网络，仅显式改变当前观测/历史准入边界，不复制网络。
 `graph/context/none` 是信息通道消融，不是新的训练目标。图边、DSL 子树和约束不因迁移裁剪。
 
+### 新主线：净效用排序（合同与观测审计阶段）
+
+`objectives/rule_utility.py` 独立定义 `rule-net-utility-v1`：预测 D/F/C，使用冻结的
+plan-cost/search-work 尺度及偏好权重得到净效用。C 是预测量，不是仅作硬预算；
+不要求精确预测毫秒。已有时间模型、训练目标和 checkpoint 不改名。
+`rank_policy_predictions` 对相同查询及权重上的完整候选策略评分，不相加独立规则分数；
+策略身份必须包含集合和优先级。缺失、失败、重复或额外查询/策略直接拒绝，不丢弃困难样本。
+这是配置排序接口，尚不是训练好的效用模型、图束搜索、promise 发布或 DRO 证书。
+
+使用现有 `comparison.json` 审计尝试、来源和 best-cost 生命周期，不执行 SQL：
+
+```sh
+python3 -m ml_orca audit-utility --comparison /path/to/comparison.json \
+  --run /stats_experiments/0/modes/replacement --output /path/to/new-audit.json
+```
+
+`--run` 是实际 JSON pointer，可重复；省略时审计其中所有运行。复用现有完整性检查，
+区分首次可行计划、同 context 的成本改善、不同统计水位/属性的不可比事件。
+源触发实例编号缺失只报告缺失，不根据规则 id 或时间相邻猜测 F/C 标签。
+带 `cost_origin_trace_version=1` 的新 trace 记录 costing 当时的 DSL 生成实例，
+审计检查实例/规则、来源链位置和时间水位；旧 trace 缺该字段时不推测补齐。
+`instance_work_ledger` 按实例集合去重菱形后继与成本事件，区分生成来源与已有输入暴露。
+这些是非独占的观测工作范围，不是完整 C 或因果贡献；跨规则不可直接相加。
+`physical_plan_source_audit` 沿 costing 当时保存的 child candidate 引用展开 best/终态计划，
+区分根 GE 来源、完整物理子计划的生成来源、已记录插入来源和已有输入暴露。
+不会使用 Group 后来的 best 反推旧计划，也不把重复生成者当成多个必要前提。
+`terminal_plan_quality` 单独保留经最终根候选核对的完整策略 cost：首次可行计划无改善事件，
+也不能视为无收益；跨策略比较仍需相同查询/数据/统计/cost 模型与独立结果校验。
+输出拒绝覆盖已有文件；该阶段不生成训练就绪标签或自动改动优化器策略。
+
+可选 `--dsl-credit-share 0.5` 启用 `new-inserter-equal-credit-v1` 的观测信用记账。
+份额必须显式设置，是敏感性参数而非实测概率；没有默认的背景/DSL 贡献比例。
+仅对可比的根成本下降，选择新计划已记录插入者中不属于旧计划生成来源的实例，
+与去重严格前驱等份分享指定份额，余量保留未归属。首次可行、失败及不可比事件保持掩码。
+`root_gain_credit.complete` 只表示记账合法，不能用 D/F 占比证明因果价值或替代终态策略监督。
+
+`objectives/search_work.py` 冻结 `observed-search-events-v1` 的可观测工作向量，
+`audit-utility` 的 `search_work_audit` 同时输出分派/实际评估/预算跳过、各状态的成本入口、
+剪枝与属性检查次数。任一事件流不完整则向量缺失，不补零；同一次成本入口不一定实际算了 cost。
+向量不是标量 C 或毫秒，组合前必须冻结权重和尺度；未覆盖的绑定构造、调度及 exclusive 工作单列。
+
+新 `cost_progress_version=1` trace 在成本保留/最优更新时记录实际工作水位。
+`audit-utility` 的 `root_search_progress` 以该时点的规则尝试、成本入口、搜索检查分别表示进度，
+不把候选创建编号当成更新时间；首次可行之前标记无计划、终止后不外推。
+旧 trace、计数倒退/越界、统计版本变化或终态成本不一致均不输出可用曲线。
+它是完整策略的观测轨迹，不是逐规则因果标签，也不等价于经过多少毫秒。
+
+当前优先研究排序：固定规则集合、CBO 阶段和预算，不扫描/优化预算。
+`python3 -m ml_orca.experiments.generate_priority_control --audit-bin ... --rules ...
+--policy ... --seed 20260914 --output ...` 从原生快照生成随机顺序控制，保持禁用项及每条
+规则的完整配置，并通过原生回读检查仅启用规则的 priority 改变。输出拒绝覆盖。
+随机顺序不是模型预测；当前 CBO priority 只作用于同一绑定的候选，不是全局 Memo 调度。
+
+`compare-workload --feature-graph` 可以原样冻结原生 v1 静态图或合并后的 v2 图，
+无需为使用静态树/约束编码而引入历史响应。版本、节点身份和边端点仍严格检查。
+`export-policy --include-search` 在原时间响应之外追加独立 `response.search`：终态质量、
+工作向量、首计划/后续更新轨迹和 trace 审计（包括 costing 时的生成实例与物理子计划来源）。
+来源审计只导出完整性和排除原因，不复制庞大的来源闭包。缺失保持掩码，结果不进入 inputs，
+不自动解除训练准入限制，也不把完整策略响应当作单条规则的 D/F/C 因果标签。
+单策略标签不要求参考策略成功：仅当本策略诊断完整、无 trace 计划匹配且独立 PG 校验通过时，
+精确分离已核实的参考策略失败。原 timing_samples 的成对比较排除原因保留，
+参考差值仍无效；未知错误、目标不一致和本策略失败仍拒绝。
+
+新的输入树 trace 在有 table descriptor 的位置记录 `relation_oid`。它只用于关联同一数据库
+采集前的 catalog，不进入神经特征。标准 `ml_orca.encoding.rule_history_encoding` 导出入口
+复用已验证的 comparison/context 快照，在对应树节点附加独立的 `ge:catalog:*` 特征；
+不替换 `ge:rows`，不触发统计推导，也不从未来 costing 回填统计。表重命名/OID 重编号不改变
+编码；未知关联、缺失行数与零行数保持区别。旧 trace 没有关系身份时仍标记未知。
+旧 corpus/recovery 调用默认不附加 catalog，已有历史工件/模型不重写；这不等于任意派生
+GroupExpression 已有基数，也尚未提供任意基数干预配置的历史编码。
+
+`--capture-pre-context` 同时保存 `stats_experiment_requests`：调用原生
+`pgorca_rule_audit --stats-requests`，复用运行时基数配置解析器，不另写 YAML 解析器。
+`requested_rows` 仅表示前置请求，不是已解析到查询的目标或实际注入结果；解析错误、
+旧二进制和超时保持 error，不改成空请求。原始文件与首尾完整性校验仍保留。
+新 trace 的 source_tree 使用 `request_binding=resolved_operator_only` 和节点 `request_index`
+关联冻结配置；`encode_observations(..., stats_requests=...)` 可输出独立的
+`ge:requested_rows`，不把序号/指纹当作特征，不把发现目标当作请求。全局策略干预编码
+尚未完成，现有干预训练准入限制不放宽；局部尝试树可能完全不含请求目标，不能硬填行数。
+
+新 trace 还在预处理后、Memo 初始化前捕获一次 `query_input_context`，比较器保存在
+`query_input_contexts`。读取器检查分片完整性、实验身份和先于 CBO 搜索的顺序。
+`encoding.group_expression_encoding.query_input_tree` 复用实际树编码，在 CBO-only 零前序
+水位下关联全查询根表达式中的请求；后续超时不抹除已经完整捕获的输入。
+完整性限于根表达式树，外部 CTE producer/完整标量语义/物理需求仍标记未观测。
+`encoding.rule_policy_encoding.pre_memo_input_sequences` 与
+`TreePolicyPredictor(..., query_input=True)` 显式接入该树：复用有序 Tree-LSTM，
+融合查询/catalog 表示后再进入 DSL 树、约束、根绑定有向消息与已准入历史 GE。
+默认模型/旧 checkpoint 不变，默认模式拒绝新输入；决策点是
+`post_preprocessing_pre_cbo`，不能静默改变旧训练输入合同。当前训练 CLI 尚未启用它。
+
+`objectives.priority.priority_pair(left, right)` 接收 `export-policy --include-search`
+导出的同一冻结 comparison 内的两个策略单元。它检查相同 SQL、catalog、统计干预、
+runtime、规则集合及全部预算，只允许 priority 不同；无限制参考组不能混入同预算排序标签。
+返回最终 cost 的 `log1p(left)-log1p(right)`、观测胜负/平局，以及分阶段搜索事件计数差。
+这些是完整优先级策略的响应，不是单条规则 D/F，也不将计数相加伪装成时间或完整 C。
+诊断/独立 PG 结果校验与时间采样分开；失败/缺失保留排除原因，cost/work 独立掩码，
+完整 trace 单独标记。平局仅表示记录精度下 cost 相同。接口不自动批准训练，仍需
+独立查询划分、明确目标头及留出选择评估；旧规划/执行时间训练目标不变。
+
+`TreePolicyPredictor(..., output_size=1)` 可显式使用单个相对策略分数；对应的
+`training.priority_loss.priority_cost_loss` 对同一输入/场景的完整已审计策略对拟合
+log1p(cost) 差，保留平局，拒绝缺失 cost/work/来源，分数不解释为绝对 cost 或毫秒。
+Tensor 损失位于 training，objectives 的标签合同继续不依赖 PyTorch。
+默认 output_size=2 的旧模型布局/初始化不变，训练 checkpoint 必须声明目标和模型配置。
+
+仅供结构读出诊断的 `query_pooling='root_mean'` 在 query_input=True 时增加所有
+Tree-LSTM 子树状态的均值通道，保留原有完整有序树和根状态；默认仍为 root。
+新配置有不同的融合矩阵，不能无声明加载旧 checkpoint。单查询两端点的固定 40 轮
+诊断仅有小幅 loss 改善，仍明显落后于训练集的每策略常量，未证明泛化或推荐价值；
+不要将该选项视作已验证的默认优化，也不启用新的大规模训练。
+
 新 observed 训练 manifest 明确记录网络、目标、输入范围、宽度和消息轮数；续训拒绝
 不兼容的配置。兼容旧 checkpoint 的 state_dict/Adam/RNG/样本位置，不改历史工件和校验值。
 旧 manifest 的源代码路径是历史来源记录，不会被重写成新路径；重新审计历史采集代码时

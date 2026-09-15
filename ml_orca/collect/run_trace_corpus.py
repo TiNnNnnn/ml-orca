@@ -126,6 +126,9 @@ def trace_metrics(records: list[dict[str, Any]]) -> dict[str, int]:
         "binding_attempts",
         "generated_alternatives",
         "duplicate_alternatives",
+        "memo_inserted_alternatives",
+        "memo_duplicate_alternatives",
+        "memo_cycle_rejected_alternatives",
         "budget_exhausted",
         "budget_skipped",
     )

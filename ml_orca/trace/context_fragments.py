@@ -20,7 +20,7 @@ class ContextFragments:
         part, parts, size = (record.get(k) for k in ('part', 'parts', 'total_bytes'))
         text = record.get('fragment')
         if (record.get('engine') != 'pgorca'
-                or field not in ('input_context', 'binding_context') or type(identity) is not int or identity < 1
+                or field not in ('input_context', 'binding_context', 'query_input_context', 'route_input_context') or type(identity) is not int or identity < 1
                 or any(type(v) is not int for v in (part, parts, size))
                 or not 0 <= part < parts <= size or record.get('encoding') != 'utf8_hex'
                 or not isinstance(text, str) or not text):

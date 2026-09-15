@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from ml_orca.common.paths import PGORCA_ROOT, TEST_ASSETS, source_file
 from ml_orca.common.artifacts import artifact_snapshot, read_snapshot
+from ml_orca.common.stats_requests import validate_request_snapshot
+from ml_orca.trace.context_fragments import ContextFragments
 
 import argparse
 from collections import defaultdict
@@ -35,6 +37,7 @@ from ml_orca.collect.run_dphyper_stability import parse_dphyper_events
 
 
 DEFAULT_WORKLOADS = TEST_ASSETS / "workloads"
+DEFAULT_RULES = TEST_ASSETS / "rules/orca_replacements.rules"
 DEFAULT_POLICY = TEST_ASSETS / "rules/empty_workload_cbo.policy"
 # COPY output is already buffered. Do not reject valid large text/aggregate fields;
 # set the process-wide CSV limit once, not concurrently in run_mode workers.
@@ -55,6 +58,9 @@ RULE_COUNTER_FIELDS = (
     "instantiate_rejected",
     "generated_alternatives",
     "duplicate_alternatives",
+    "memo_inserted_alternatives",
+    "memo_duplicate_alternatives",
+    "memo_cycle_rejected_alternatives",
     "budget_exhausted",
     "budget_skipped",
     "match_us",
@@ -85,8 +91,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workload", action="append", help="workload directory name; defaults to the four benchmark suites")
     parser.add_argument("-t", "--test", action="append", default=[], help="glob of workload/query_stem")
     parser.add_argument("--workload-dir", type=Path, default=DEFAULT_WORKLOADS)
-    parser.add_argument("--rule-file", type=Path, default=TEST_ASSETS / "rules/orca_replacements.rules")
-    parser.add_argument("--policy-file", type=Path, default=DEFAULT_POLICY)
+    parser.add_argument("--rule-file", type=Path, default=DEFAULT_RULES)
+    parser.add_argument("--policy-file", type=Path)
     parser.add_argument(
         "--stats-experiment", type=Path, action="append", default=[],
         help="also run each query with this cardinality experiment (repeatable)",
@@ -163,6 +169,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("DRO collection requires --profile-cbo-only, positive --timing-repeats and --postgres-oracle")
     if args.unbounded:
         args.policy_file = None
+    elif args.policy_file is None and args.rule_file.resolve() == DEFAULT_RULES.resolve():
+        args.policy_file = DEFAULT_POLICY
     missing = [path for path in args.stats_experiment if not path.is_file()]
     if missing:
         parser.error(f"stats experiment not found: {missing[0]}")
@@ -209,9 +217,10 @@ def freeze_feature_graph(source: Path, output: Path) -> dict:
         raise ValueError('feature graph must be outside the new output directory')
     raw = source.read_bytes()
     graph = json.loads(raw)
-    if (not isinstance(graph, dict) or graph.get('schema_version') != 2
+    if (not isinstance(graph, dict) or type(graph.get('schema_version')) is not int
+            or graph['schema_version'] not in (1, 2)
             or not isinstance(graph.get('nodes'), list) or not isinstance(graph.get('edges'), list)):
-        raise ValueError('expected a version 2 rule graph with nodes and edges')
+        raise ValueError('expected a native v1 or merged v2 rule graph with nodes and edges')
     json.dumps(graph, allow_nan=False)
     hashes = []
     for node in graph['nodes']:
@@ -370,6 +379,27 @@ def collect_policy_context(binary: Path, rules: Path, policies: dict, timeout: i
     return snapshots
 
 
+def collect_stats_requests(binary: Path, experiments: list[Path], timeout: int) -> dict:
+    """Freeze native-parsed requests before any query; never claim target resolution."""
+    snapshots = {}
+    for index, path in enumerate(experiments):
+        data, error, rc = None, '', None
+        try:
+            result = run([str(binary), '--stats-requests', str(path)],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+            rc = result.returncode
+            if rc:
+                error = result.stderr
+            else:
+                data = json.loads(result.stdout)
+                validate_request_snapshot(data)
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError) as failure:
+            data, error = None, str(failure)
+        snapshots[str(index)] = {'status': 'error' if data is None else 'ok',
+                                 'returncode': rc, 'error': error, 'snapshot': data}
+    return snapshots
+
+
 def collect_catalog_context(binary: Path, socket: Path, port: int, database: str, timeout: int) -> dict:
     """Existing catalog estimates, never actual counts or forced ANALYZE/ORCA derivation."""
     sql = """
@@ -462,6 +492,9 @@ SET client_min_messages=log;
 def trace_records(text: str) -> list[dict[str, Any]]:
     records = []
     contexts = {}
+    search_started = False
+    query_input = None
+    fragments = ContextFragments()
     for line in text.splitlines():
         if "DSL_TRACE {" not in line:
             continue
@@ -470,13 +503,23 @@ def trace_records(text: str) -> list[dict[str, Any]]:
             record = json.loads(payload[: payload.rfind("}") + 1])
         except (ValueError, json.JSONDecodeError):
             continue
+        record = fragments.accept(record)
+        if record is None:
+            continue
         if record.get("kind") == "candidate_context":
             key = record.get("field"), record.get("context_id")
-            if key[0] not in ("input_context", "binding_context") or type(key[1]) is not int or key[1] < 1:
+            if key[0] not in ("input_context", "binding_context", "query_input_context", "route_input_context") or type(key[1]) is not int or key[1] < 1:
                 raise ValueError("invalid candidate context definition")
             if not isinstance(record.get("value"), dict) or (key in contexts and contexts[key] != record["value"]):
                 raise ValueError("invalid or conflicting candidate context definition")
             contexts[key] = record["value"]
+            if key[0] == 'query_input_context':
+                if query_input is not None or search_started:
+                    raise ValueError('duplicate or late query input context')
+                query_input = record['value']
+        if (record.get('kind') in ('cost_candidate', 'search_check', 'group_stats_lifecycle') or
+                (record.get('kind') == 'rule_candidate' and record.get('placement') == 'cbo')):
+            search_started = True
         if record.get("kind") == "rule_candidate":
             for field in ("input_context", "binding_context"):
                 if field + "_id" not in record:
@@ -486,9 +529,21 @@ def trace_records(text: str) -> list[dict[str, Any]]:
                     record.setdefault("context_resolution_errors", []).append(field)
                 else:
                     record[field] = deepcopy(value)
+        if record.get("kind") == "rule_route":
+            value = contexts.get(("route_input_context", record.get("route_input_context_id")))
+            if value is None:
+                record.setdefault("context_resolution_errors", []).append("route_input_context")
+            else:
+                record["route_input_context"] = deepcopy(value)
         records.append(record)
         if record.get("kind") == "experiment_outcome":
+            if record.get('query_input_context_version') == 1 and (query_input is None or
+                    query_input.get('experiment') != record.get('experiment')):
+                raise ValueError('missing or mismatched query input context')
             contexts.clear()  # Context IDs are query-local; support concatenated completed runs.
+            search_started = False
+            query_input = None
+    fragments.finish()
     return records
 
 
@@ -676,7 +731,8 @@ def dsl_observability(records: list[dict[str, Any]]) -> dict[str, Any]:
     counter_fields = (
         "binding_attempts", "bound_symbols", "match_us", "constraint_us", "instantiate_us",
         "match_rejected", "constraint_rejected", "instantiate_rejected", "generated_alternatives",
-        "duplicate_alternatives", "budget_exhausted", "budget_skipped",
+        "duplicate_alternatives", "memo_inserted_alternatives", "memo_duplicate_alternatives",
+        "memo_cycle_rejected_alternatives", "budget_exhausted", "budget_skipped",
     )
     for (key, _), record in registrations.items():
         if key not in rules:
@@ -985,6 +1041,10 @@ def run_mode(
             and record.get("status") in {"applied", "applied_rbo"}
             and "rule_hash" in record
         ],
+        "rule_rejections": [record for record in records
+                            if record.get("kind") == "application"
+                            and record.get("status") in {
+                                "constraint_rejected", "instantiate_rejected"}],
         "profile_rule_statuses": [
             record.get("status") for record in records
             if record.get("kind") == "application"
@@ -1002,9 +1062,14 @@ def run_mode(
         ],
         "candidate_events": [record for record in records
                              if record.get("kind") in {"rule_candidate", "rule_candidate_outcome"}],
+        "query_input_contexts": [record['value'] for record in records
+                                 if record.get('kind') == 'candidate_context' and record.get('field') == 'query_input_context'],
+        "rule_route_inputs": [record for record in records if record.get("kind") == "rule_route"],
+        "rule_route_outcomes": [record for record in records if record.get("kind") == "rule_route_outcome"],
         "cost_events": [record for record in records if record.get("kind") == "cost_candidate"],
         "stats_lifecycle_events": [record for record in records if record.get("kind") == "group_stats_lifecycle"],
         "cost_lifecycle_events": [record for record in records if record.get("kind") == "cost_lifecycle"],
+        "optimizer_progress": [record for record in records if record.get("kind") == "optimizer_progress"],
         "search_checks": [record for record in records if record.get("kind") == "search_check"],
         "rule_edges": [record for record in records if record.get("kind") == "rule_edge"],
         "experiment_outcomes": [
@@ -1765,6 +1830,10 @@ def main() -> int:
     args.artifact_paths = {"postgres": pg_bindir / "postgres", "pg_orca": pg_libdir / "pg_orca.so",
                            "rule_audit": Path(args.audit_bin), "rules": args.rule_file,
                            "runner": Path(__file__)}
+    if args.capture_pre_context:
+        args.artifact_paths.update(
+            stats_request_validator=Path(validate_request_snapshot.__code__.co_filename),
+            trace_context_reader=Path(ContextFragments.accept.__code__.co_filename))
     args.feature_graph_snapshot = None
     if args.feature_graph:
         args.feature_graph_snapshot = freeze_feature_graph(args.feature_graph, args.output)
@@ -1872,6 +1941,8 @@ def main() -> int:
                         settings_sql={'native': settings('native', semantic_xforms, None),
                             **{name: settings('replacement', semantic_xforms, path) for name, path in policies.items()}},
                         stats_experiment_documents={str(i): path.read_text() for i, path in enumerate(args.stats_experiment)},
+                        stats_experiment_requests=collect_stats_requests(
+                            Path(args.audit_bin), args.stats_experiment, args.timeout),
                         capture_input_endpoints_equal=artifact_snapshot(args.pre_context_inputs) == args.pre_context_start)
                     if args.feature_graph_snapshot is not None:
                         context['feature_graph'] = args.feature_graph_snapshot

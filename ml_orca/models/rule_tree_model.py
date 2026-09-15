@@ -184,14 +184,33 @@ class RuleTreeEncoder(nn.Module):
         return list(zip(rules.unbind(0), states.split(sizes)))
 
 
+def input_tree_nodes(tree):
+    """Shared validation for observed query/GE trees (not DSL two-root forests)."""
+    nodes, root = tree['nodes'], tree['root']
+    if type(root) is not int or not 0 <= root < len(nodes) or nodes[root]['path'] != 'r':
+        raise ValueError('invalid observed tree root')
+    ownership = [0] * len(nodes)
+    for index, node in enumerate(nodes):
+        for slot, child in enumerate(node['children']):
+            if (type(child) is not int or not 0 <= child < index
+                    or nodes[child]['path'] != node['path'] + '/' + str(slot)):
+                raise ValueError('invalid observed ordered child')
+            ownership[child] += 1
+    if any(n != (0 if i == root else 1) for i, n in enumerate(ownership)):
+        raise ValueError('invalid observed tree ownership')
+    return nodes
+
+
 class TreePolicyPredictor(WholePolicyPredictor):
     """Constraint-aware tree roots condition each directed message at every graph round."""
 
     def __init__(self, vocabulary_size, width=32, graph_mode='static', message_rounds=3, history=False,
-                 history_mode='graph', history_pooling='mean'):
-        if graph_mode not in ('none', 'static', 'self') or type(message_rounds) is not int or message_rounds < 1:
+                 history_mode='graph', history_pooling='mean', query_input=False, output_size=2,
+                 query_pooling='root'):
+        if (graph_mode not in ('none', 'static', 'self') or type(message_rounds) is not int or message_rounds < 1
+                or type(query_input) is not bool):
             raise ValueError('invalid tree graph configuration')
-        super().__init__(vocabulary_size, width, 'none')
+        super().__init__(vocabulary_size, width, 'none', output_size)
         self.graph_mode = graph_mode
         self.rule_trees = RuleTreeEncoder(width)
         self.rounds = nn.ModuleList([DirectedRuleAggregation(width, rooted=True)
@@ -209,6 +228,33 @@ class TreePolicyPredictor(WholePolicyPredictor):
             self.history_update = nn.Linear((2 if history_pooling == 'mean_variance' else 1) * width + 1,
                                             width, bias=False)
             self.history_ports = nn.Linear(width, 2 * width)
+        self.use_query_input = query_input
+        if query_pooling not in ('root', 'root_mean') or (not query_input and query_pooling != 'root'):
+            raise ValueError('query pooling requires explicitly enabled query inputs')
+        self.query_pooling = query_pooling
+        if query_input:
+            self.query_input_fusion = nn.Linear((3 if query_pooling == 'root_mean' else 2) * width, width)
+
+    def query_inputs(self, features):
+        query = query_context_embedding(self.encoder, features)
+        if not self.use_query_input:
+            if ('query_input_tree' in features or 'query_input_node' in features['sequences'] or
+                    features.get('decision_point') == 'post_preprocessing_pre_cbo'):
+                raise ValueError('model must explicitly enable pre-Memo query inputs')
+            return query
+        tree = features.get('query_input_tree', {})
+        if (not isinstance(tree, dict) or features.get('decision_point') != 'post_preprocessing_pre_cbo' or
+                tree.get('capture') != 'before_memo_initialization' or
+                tree.get('scope') != 'pre_memo_query_root_expression' or tree.get('complete') is not True):
+            raise ValueError('require a complete pre-Memo query input')
+        nodes = input_tree_nodes(tree)
+        states = self.rule_trees.tree_states(self.encoder(features['sequences']['query_input_node']), nodes)
+        summary = [query, states[tree['root']:tree['root'] + 1]]
+        if self.query_pooling == 'root_mean':
+            # Keep the ordered tree root; a second readout path exposes deep
+            # subtree states without traversing all ancestor gates again.
+            summary.append(states.mean(0, keepdim=True))
+        return torch.tanh(self.query_input_fusion(torch.cat(summary, 1)))
 
     def history_inputs(self, features, query, local):
         """Historical actual trees with behavior query/catalog/policy, no current Memo."""
@@ -247,18 +293,7 @@ class TreePolicyPredictor(WholePolicyPredictor):
             if tree is None:
                 sizes.append(0)
                 continue
-            nodes, root = tree['nodes'], tree['root']
-            if type(root) is not int or not 0 <= root < len(nodes) or nodes[root]['path'] != 'r':
-                raise ValueError('invalid historical tree root')
-            ownership = [0] * len(nodes)
-            for node in nodes:
-                for slot, child in enumerate(node['children']):
-                    if (type(child) is not int or not 0 <= child < len(nodes)
-                            or nodes[child]['path'] != node['path'] + '/' + str(slot)):
-                        raise ValueError('invalid historical ordered child')
-                    ownership[child] += 1
-            if any(n != (0 if i == root else 1) for i, n in enumerate(ownership)):
-                raise ValueError('invalid historical tree ownership')
+            nodes = input_tree_nodes(tree)
             values = take('history_node', tree['node_range'])
             if len(values) != len(nodes):
                 raise ValueError('one feature vector per tree node required')
@@ -341,7 +376,7 @@ class TreePolicyPredictor(WholePolicyPredictor):
         if (len(loaded) != len(trees) or len(loaded) != len(sequences['policy'])
                 or any(type(flag) is not bool for flag in loaded)):
             raise ValueError('invalid loaded tree rule membership')
-        query = query_context_embedding(self.encoder, features)
+        query = self.query_inputs(features)
         active = [i for i, flag in enumerate(loaded) if flag]
         local = {index: position for position, index in enumerate(active)}
         encoded = self.rule_trees.forward_many([trees[i] for i in active], sequences, self.encoder)

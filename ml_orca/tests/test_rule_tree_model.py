@@ -58,6 +58,151 @@ class RuleTreeModelTest(unittest.TestCase):
     def tearDown(self):
         torch.set_num_threads(self.threads)
 
+    def test_pre_memo_query_tree_is_explicit_trainable_and_preserves_legacy_defaults(self):
+        from ml_orca.models.rule_tree_model import TreePolicyPredictor
+        features, vocabulary = tree_features([ir_fixture(), ir_fixture()], ('r', 'r/0'))
+        for token in ('ge:operator:CLogicalGet', 'ge:operator:CLogicalSelect', 'ge:requested_rows'):
+            vocabulary.setdefault(token, len(vocabulary))
+        baseline = deepcopy(features)
+        features.update(decision_point='post_preprocessing_pre_cbo', query_input_tree={
+            'capture': 'before_memo_initialization', 'scope': 'pre_memo_query_root_expression', 'complete': True,
+            'nodes': [{'path': 'r/0/0', 'children': []}, {'path': 'r/0', 'children': [0]},
+                      {'path': 'r', 'children': [1]}], 'root': 2})
+        query_sequences = [
+            [('ge:operator:CLogicalGet', None), ('ge:requested_rows', 2.)],
+            [('ge:operator:CLogicalSelect', None)], [('ge:operator:CLogicalSelect', None)]]
+        features['sequences']['query_input_node'] = [encode_sequence(s, vocabulary) for s in query_sequences]
+        torch.manual_seed(71)
+        old = TreePolicyPredictor(len(vocabulary), 8)
+        torch.manual_seed(71)
+        model = TreePolicyPredictor(len(vocabulary), 8, query_input=True)
+        for key, value in old.state_dict().items():
+            torch.testing.assert_close(value, model.state_dict()[key], rtol=0, atol=0)
+        before = old(baseline)
+        with self.assertRaisesRegex(ValueError, 'explicitly enable'):
+            old(features)
+        with self.assertRaisesRegex(ValueError, 'complete pre-Memo'):
+            model(baseline)
+        with self.assertRaises(RuntimeError):
+            model.load_state_dict(old.state_dict())
+        observed = model(features)
+        changed = deepcopy(features)
+        changed['sequences']['query_input_node'][0]['numbers'][1] = 7.
+        self.assertFalse(torch.equal(model.query_inputs(features), model.query_inputs(changed)))
+        self.assertFalse(torch.equal(observed, model(changed)))
+        poison = deepcopy(features)
+        poison.update(final_plan={'rows': 999}, response={'cost': 999}, candidate_events=[{'future': True}])
+        torch.testing.assert_close(observed, model(poison), rtol=0, atol=0)
+        for mutate in (lambda f: f['query_input_tree'].update(capture='after_search'),
+                       lambda f: f['query_input_tree']['nodes'][0].update(children=[2]),
+                       lambda f: f['query_input_tree'].update(complete=False)):
+            bad = deepcopy(features)
+            mutate(bad)
+            with self.assertRaises(ValueError):
+                model(bad)
+        observed.sum().backward()
+        self.assertTrue(torch.isfinite(model.query_input_fusion.weight.grad).all())
+        self.assertGreater(model.query_input_fusion.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(model.rule_trees.child_order.weight_ih_l0.grad.abs().sum().item(), 0)
+        clone = TreePolicyPredictor(len(vocabulary), 8, query_input=True)
+        clone.load_state_dict(model.state_dict())
+        torch.testing.assert_close(observed, clone(features), rtol=0, atol=0)
+        torch.testing.assert_close(before, old(baseline), rtol=0, atol=0)
+
+        pooled = TreePolicyPredictor(len(vocabulary), 8, query_input=True, query_pooling='root_mean')
+        states = pooled.rule_trees.tree_states(pooled.encoder(features['sequences']['query_input_node']),
+                                               features['query_input_tree']['nodes'])
+        from ml_orca.models.sequence import query_context_embedding
+        expected = torch.tanh(pooled.query_input_fusion(torch.cat((
+            query_context_embedding(pooled.encoder, features), states[2:3], states.mean(0, keepdim=True)), 1)))
+        torch.testing.assert_close(pooled.query_inputs(features), expected, rtol=0, atol=0)
+        pooled(features).square().sum().backward()
+        self.assertGreater(pooled.query_input_fusion.weight.grad[:, 16:].abs().sum().item(), 0)
+        self.assertGreater(pooled.rule_trees.child_order.weight_ih_l0.grad.abs().sum().item(), 0)
+        for params in ({'query_pooling': 'root_mean'}, {'query_input': True, 'query_pooling': 'unknown'}):
+            with self.assertRaises(ValueError):
+                TreePolicyPredictor(len(vocabulary), 8, **params)
+        with self.assertRaises(RuntimeError):
+            pooled.load_state_dict(model.state_dict())
+
+        # Query input and admitted historical GE/rooted edges must compose.
+        from ml_orca.tests.test_rule_history_encoding import history_fixture, attach
+        historical, bundle = history_fixture()
+        historical = attach(historical, bundle)
+        historical.update(decision_point=features['decision_point'], query_input_tree=features['query_input_tree'])
+        historical['sequences']['query_input_node'] = query_sequences
+        vocabulary = fit_vocabulary([historical['sequences']])
+        historical['sequences'] = {k: [encode_sequence(s, vocabulary) for s in value]
+                                   for k, value in historical['sequences'].items()}
+        combined = TreePolicyPredictor(len(vocabulary), 8, history=True, query_input=True)
+        output = combined(historical)
+        self.assertTrue(torch.isfinite(output).all())
+        output.square().sum().backward()
+        for parameter in (combined.history_update.weight, combined.query_input_fusion.weight,
+                          combined.rounds[0].update.weight):
+            self.assertTrue(torch.isfinite(parameter.grad).all())
+            self.assertGreater(parameter.grad.abs().sum().item(), 0)
+
+    def test_priority_readout_is_explicit_and_legacy_head_stays_two_channels(self):
+        from ml_orca.models.rule_tree_model import TreePolicyPredictor
+        from ml_orca.objectives.priority import priority_pair
+        from ml_orca.training.priority_loss import priority_cost_loss
+        from ml_orca.tests.test_priority_control import policy_cell
+        features, vocabulary = tree_features([ir_fixture(), ir_fixture()])
+        torch.manual_seed(71)
+        default = TreePolicyPredictor(len(vocabulary), 8)
+        torch.manual_seed(71)
+        explicit = TreePolicyPredictor(len(vocabulary), 8, output_size=2)
+        for name, value in default.state_dict().items():
+            torch.testing.assert_close(value, explicit.state_dict()[name], rtol=0, atol=0)
+        model = TreePolicyPredictor(len(vocabulary), 8, output_size=1)
+        changed = deepcopy(features)
+        # Same query and DSL/graph; only policy priority changes.
+        for sequence in changed['sequences']['policy']:
+            index = sequence['tokens'].index(vocabulary['priority'])
+            sequence['numbers'][index] = .5
+            sequence['known_number'][index] = True
+        scores = torch.cat([model(features), model(changed)])
+        report = priority_pair(policy_cell('a', 10), policy_cell('b', 2))
+        loss = priority_cost_loss(scores, [(0, 1, report)])
+        loss.backward()
+        self.assertTrue(torch.isfinite(model.readout[-1].weight.grad).all())
+        self.assertGreater(model.readout[-1].weight.grad.abs().sum().item(), 0)
+        with self.assertRaises(RuntimeError):
+            model.load_state_dict(default.state_dict())
+        for size in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                TreePolicyPredictor(len(vocabulary), 8, output_size=size)
+
+    def test_priority_loss_preserves_ties_offsets_and_rejects_unadmitted_pairs(self):
+        from ml_orca.objectives.priority import priority_pair
+        from ml_orca.training.priority_loss import priority_cost_loss
+        from ml_orca.tests.test_priority_control import policy_cell
+        report = priority_pair(policy_cell('a', 10), policy_cell('b', 2))
+        scores = torch.tensor([1., 0.], requires_grad=True)
+        loss = priority_cost_loss(scores, [(0, 1, report)])
+        torch.testing.assert_close(loss, priority_cost_loss(scores + 5, [(0, 1, report)]))
+        reverse = priority_pair(policy_cell('b', 2), policy_cell('a', 10))
+        torch.testing.assert_close(loss, priority_cost_loss(scores, [(1, 0, reverse)]))
+        loss.backward()
+        self.assertAlmostEqual(scores.grad.sum().item(), 0)
+        tie = priority_pair(policy_cell('a'), policy_cell('b'))
+        self.assertEqual(priority_cost_loss(torch.zeros(2), [(0, 1, tie)]).item(), 0)
+        self.assertGreater(priority_cost_loss(scores, [(0, 1, tie)]).item(), 0)
+        for pairs in ([], [(0, 0, report)], [(0, 2, report)], [(0, 1, report), (1, 0, reverse)]):
+            with self.assertRaises(ValueError):
+                priority_cost_loss(scores, pairs)
+        for mutate in (lambda r: r.update(trace_complete=False),
+                       lambda r: r.update(work_delta=None),
+                       lambda r: r.update(cost_exclusions=['missing']),
+                       lambda r: r['cost'].update(log1p_margin=999)):
+            invalid = deepcopy(report)
+            mutate(invalid)
+            with self.assertRaises(ValueError):
+                priority_cost_loss(scores, [(0, 1, invalid)])
+        with self.assertRaises(ValueError):
+            priority_cost_loss(torch.tensor([float('nan'), 0.]), [(0, 1, report)])
+
     def test_recursive_tree_topology_order_and_arbitrary_child_count(self):
         from ml_orca.models.rule_tree_model import RuleTreeEncoder
         model = RuleTreeEncoder(8)
