@@ -66,6 +66,8 @@ def candidate_state(row: dict) -> dict:
     if not captured:
         context = {}
     children = context.get("children", [])
+    bound_tables = [symbol for symbol in (row.get("binding_context") or {}).get("symbols", [])
+                    if isinstance(symbol, dict) and symbol.get("kind") == "table"]
     return {"capture": "before_evaluation", "captured": bool(captured),
             "features": input_context_features(context),
             # Run identity is supplied by the surrounding report. Never pool these IDs as features.
@@ -78,6 +80,9 @@ def candidate_state(row: dict) -> dict:
                               for k in ("group", "group_expression", "statistics_owner_group")},
                 "child_memo": [{"position": c["position"], **{k: (c["node"].get("memo_state") or {}).get(k)
                                 for k in ("group", "group_expression", "statistics_owner_group")}} for c in children],
+                "bound_table_memo": [{k: symbol.get(k) for k in
+                                      ("symbol_index", "memo_group", "memo_group_expression")}
+                                     for symbol in bound_tables],
                 "child_references": [{"position": c["position"], "reference_key": c["node"].get("reference_key")}
                                      for c in children]}}
 
@@ -144,10 +149,15 @@ def binding_shape_features(row: dict) -> dict:
             and s["shape"].get("pattern_nodes") == 0 for s in predicates):
         predicate_structure = "constant_only" if all(s["shape"]["operators"] == {"CScalarConst": 1}
                                                      for s in predicates) else "nonconstant_shape"
+    table_statistics = ([{"symbol_index": s.get("symbol_index"),
+                          "stats_source": s.get("stats_source", "missing"), "rows": s.get("rows")}
+                         for s in sorted(tables, key=lambda value: value.get("symbol_index", -1))]
+                        if valid else None)
     return {"source_subqueries": subquery_class(source), "bound_predicate_subqueries": predicate,
             "bound_predicate_structure": predicate_structure,
             "bound_table_nodes": sum(s["shape"]["nodes"] for s in tables) if sizes_known else None,
-            "bound_table_depth": max(s["shape"]["depth"] for s in tables) if sizes_known else None}
+            "bound_table_depth": max(s["shape"]["depth"] for s in tables) if sizes_known else None,
+            "bound_table_statistics": table_statistics}
 
 
 def candidate_evidence(run: dict) -> dict:
@@ -246,7 +256,7 @@ def binding_origin_evidence(run: dict) -> dict:
     finals = run.get("experiment_outcomes", [])
     final = finals[0] if len(finals) == 1 else {}
     version = final.get("binding_edge_trace_version")
-    if version not in (1, 2, 3, 4):
+    if version not in (1, 2, 3, 4, 5, 6):
         problems.append("binding_edge_trace_version_missing")
     edges = run.get("rule_edges")
     if not isinstance(edges, list):
@@ -278,15 +288,15 @@ def binding_origin_evidence(run: dict) -> dict:
                 or edge.get("relation") != (relation if candidate.get("status") == "ready_cbo" else "binding_observed")):
             problems.append("invalid_binding_edge_relation")
         producer_outcomes = {"memo_inserted", "memo_duplicate"}
-        if version in (3, 4):
+        if version in (3, 4, 5, 6):
             producer_outcomes.add("memo_rehashed")
-        if version in (2, 3, 4) and edge.get("producer_outcome") not in producer_outcomes:
+        if version in (2, 3, 4, 5, 6) and edge.get("producer_outcome") not in producer_outcomes:
             problems.append("invalid_binding_producer_outcome")
         identity = (edge.get("dst_candidate_sequence"), path)
-        if version in (2, 3, 4):
+        if version in (2, 3, 4, 5, 6):
             identity += (edge.get("src_rule"), edge.get("src_target_path"), relation,
                          edge.get("producer_outcome"))
-        if version == 4:
+        if version in (4, 5, 6):
             seq = edge.get('src_candidate_sequence')
             source = candidates.get(seq, {})
             dst = edge.get('dst_candidate_sequence')
@@ -299,15 +309,15 @@ def binding_origin_evidence(run: dict) -> dict:
             problems.append("duplicate_binding_position")
         observed.add(identity)
     return {"complete": not problems, "exclusions": sorted(set(problems)), "edges": edges,
-            "producer_instance_coverage": "validated_source_attempts" if version == 4 else "unavailable",
-            "producer_coverage": ("observed_before_binding_including_memo_duplicates_and_rehash" if version in (3, 4) else
+            "producer_instance_coverage": "validated_source_attempts" if version in (4, 5, 6) else "unavailable",
+            "producer_coverage": ("observed_before_binding_including_memo_duplicates_and_rehash" if version in (3, 4, 5, 6) else
                                   "observed_before_binding_including_memo_duplicates" if version == 2 else "first_inserter_only"),
             "scope": "direct_DSL_origins_in_extracted_CBO_bindings_including_failed_evaluations",
             "not_included": ["unbound_memo_alternatives", "template_path_mapping", "all_causal_enablers",
                              "transitive_native_xform_origins",
                              "producers_observed_after_binding"] +
-                            (["origins_coalesced_by_later_group_rehash"] if version not in (3, 4) else []) +
-                            (["duplicate_candidate_producers"] if version not in (2, 3, 4) else [])}
+                            (["origins_coalesced_by_later_group_rehash"] if version not in (3, 4, 5, 6) else []) +
+                            (["duplicate_candidate_producers"] if version not in (2, 3, 4, 5, 6) else [])}
 
 
 def cost_evidence(run: dict) -> dict:
@@ -1087,6 +1097,55 @@ def target_root_costs(run: dict, target: list[dict], include_ancestors: bool = F
                 if include_ancestors else "same_run_inserted_root_direct_physical_origin_not_all_descendants_or_causal_benefit"}
 
 
+def target_generated_costs(run: dict, target: list[dict]) -> dict:
+    """Compact physical observations whose provenance directly consumes an inserted target."""
+    inserted = {r["sequence"] for r in target
+                if (r.get("memo_outcome") or {}).get("status") == "memo_inserted"}
+    by_sequence = {event["sequence"]: event for event in run.get("cost_events", [])}
+    rows, seen = [], set()
+    for event in run.get("cost_events", []):
+        if event.get("status") != "costed":
+            continue
+        paths = sorted({origin.get("target_path") for origin in event.get("dsl_origin_instances", [])
+                        if origin.get("candidate_sequence") in inserted
+                        and origin.get("relation") == "memo_consumes"
+                        and origin.get("target_path") is not None})
+        if not paths:
+            continue
+        children = [{"sequence": child.get("cost_candidate_sequence"),
+                     "operator": by_sequence.get(child.get("cost_candidate_sequence"), {}).get("operator"),
+                     "rows": by_sequence.get(child.get("cost_candidate_sequence"), {}).get("rows")}
+                    for child in event.get("child_contexts", [])]
+        key = (tuple(paths), event.get("operator"), event.get("rows"),
+               tuple((child["operator"], child["rows"]) for child in children))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"sequence": event["sequence"], "target_paths": paths,
+                     "operator": event.get("operator"), "rows": event.get("rows"),
+                     "cost": event.get("cost"), "children": children})
+    source_roots, source_children = [], []
+    stats = {event.get("group"): event for event in run.get("stats_events", [])
+             if event.get("site") == "memo_group"}
+    for candidate in target:
+        if candidate.get("sequence") not in inserted:
+            continue
+        provenance = (candidate.get("pre_evaluation_state") or {}).get("provenance") or {}
+        root = provenance.get("root_memo") or {}
+        event = stats.get(root.get("group"), {})
+        source_roots.append({"candidate_sequence": candidate["sequence"], "group": root.get("group"),
+                             "operator": event.get("operator"), "rows": event.get("native_rows")})
+        for child in provenance.get("child_memo", []):
+            event = stats.get(child.get("group"), {})
+            source_children.append({"candidate_sequence": candidate["sequence"],
+                                    "position": child.get("position"), "group": child.get("group"),
+                                    "operator": event.get("operator"), "rows": event.get("native_rows")})
+    return {"inserted_candidate_sequences": sorted(inserted), "source_roots": source_roots,
+            "source_children": source_children,
+            "physical_observations": rows,
+            "scope": "same_run_direct_inserted_target_provenance_post_search_not_pre_evaluation_features"}
+
+
 def post_search_evidence(run: dict) -> dict:
     """Observed physical descendants of inserted roots, never pre-decision features."""
     candidates = candidate_evidence(run)
@@ -1149,6 +1208,18 @@ def observed_rule_edges(run: dict, artifact: Path | None) -> list[dict] | None:
     if artifact is None or not artifact.is_file():
         return None  # Missing evidence differs from an observed empty edge stream.
     return [record for record in trace_records(artifact.read_text()) if record.get("kind") == "rule_edge"]
+
+
+def rule_edge_summary(run: dict, artifact: Path | None) -> dict:
+    source = run.get("rule_edges_source")
+    if isinstance(source, dict):
+        return {"edge_count": source.get("count"),
+                "count_complete": source.get("count_complete"),
+                "source": str(artifact) if artifact is not None else source.get("artifact")}
+    edges = run.get("rule_edges")
+    return {"edge_count": len(edges) if isinstance(edges, list) else None,
+            "count_complete": None,
+            "source": str(artifact) if artifact is not None else None}
 
 
 def cbo_contribution(manifest: dict, comparison: dict, manifest_dir: Path,
@@ -1217,11 +1288,15 @@ def cbo_contribution(manifest: dict, comparison: dict, manifest_dir: Path,
         search = search_contribution(arms, reasons)
         states = Counter((binding_shape_features(r)["bound_predicate_structure"], r["status"],
                           r.get("failed_constraint")) for r in target)
-        rows.append({"factors": point["factors"], "statuses": statuses, "exclusions": sorted(set(reasons)),
+        rows.append({"experiment": point.get("experiment"), "factors": point["factors"],
+                     "requested_rows": point.get("requested_rows"),
+                     "stats_targets": {arm: ((run.get("experiment_outcomes") or [{}])[0].get("stats_targets"))
+                                       for arm, run in arms.items()},
+                     "statuses": statuses, "exclusions": sorted(set(reasons)),
                      "dependencies": {"scope": "successful_cbo_source_root_provenance_not_complete_binding_dependencies",
                          "arms": {arm: {"complete_candidate_trace": arm in audited,
-                             "edges": observed_rule_edges(run, artifacts / f"profile-{scenario_index}.{arm}.trace"
-                                                          if artifacts is not None else None)}
+                             **rule_edge_summary(run, artifacts / f"profile-{scenario_index}.{arm}.trace"
+                                                if artifacts is not None else None)}
                                   for arm, run in arms.items()}},
                      "target_states": [{"predicate_structure": shape, "status": status,
                                         "failed_constraint": constraint, "attempts": count}
@@ -1240,28 +1315,47 @@ def cbo_contribution(manifest: dict, comparison: dict, manifest_dir: Path,
                      "off_fallback_cbo_ok": statuses["off"] == "fallback" and statuses["cbo"] == "ok",
                      "plan_change": plan_change, "search": search,
                      "target_root_costs": target_root_costs(arms["cbo"], target)
+                         if "cbo" in audited and search["arms"]["cbo"]["complete"] else None,
+                     "target_generated_costs": target_generated_costs(arms["cbo"], target)
                          if "cbo" in audited and search["arms"]["cbo"]["complete"] else None})
     return rows
+
+
+def factor_axis(report: dict) -> tuple[list[tuple], dict[tuple, float], list[str], bool]:
+    """Use a log axis for one positive factor and labeled cells for factorial designs."""
+    factors = sorted({tuple(row["factors"]) for row in report["runs"]})
+    dimensions = {len(factor) for factor in factors}
+    if len(dimensions) != 1:
+        raise ValueError("inconsistent factor dimensions")
+    logarithmic = bool(factors and dimensions == {1} and all(factor[0] > 0 for factor in factors))
+    positions = {factor: factor[0] if logarithmic else float(index)
+                 for index, factor in enumerate(factors)}
+    names = report.get("factor_labels") or report.get("factor_coordinates") or [
+        f"因子{i + 1}" for i in range(next(iter(dimensions), 0))]
+    labels = ["／".join(f"{names[i] if i < len(names) else f'因子{i + 1}'}={value:g}"
+                       for i, value in enumerate(factor)) for factor in factors]
+    return factors, positions, labels, logarithmic
 
 
 def render_cbo_contribution(report: dict, output: Path, font: Path) -> None:
     plt = chinese_plotting(font)
     fig, axes = plt.subplots(3, 2, figsize=(14, 13), layout="constrained")
     rows = report["runs"]
-    factors = sorted({r["factors"][0] for r in rows})
+    factors, positions, labels, logarithmic = factor_axis(report)
     for axis, field, title in zip(axes[0], ("delta_planning_ms", "delta_execution_ms"), ("规划时间的条件贡献", "执行时间的条件贡献")):
         for factor in factors:
-            selected = [r for r in rows if r["factors"] == [factor]]
+            selected = [r for r in rows if tuple(r["factors"]) == factor]
             values = [(r.get("family_weight", 1.0), [p[field] for p in r["pairs"] if p[field] is not None])
                       for r in selected]
-            axis.scatter([factor for _, vs in values for _ in vs], [v for _, vs in values for v in vs], alpha=0.35)
+            x = positions[factor]
+            axis.scatter([x for _, vs in values for _ in vs], [v for _, vs in values for v in vs], alpha=0.35)
             means = [(w, sum(vs) / len(vs)) for w, vs in values if vs]
             if means:
-                axis.scatter(factor, sum(w * v for w, v in means) / sum(w for w, _ in means), marker="_", s=180, color="#ee7733")
+                axis.scatter(x, sum(w * v for w, v in means) / sum(w for w, _ in means), marker="_", s=180, color="#ee7733")
         axis.set(title=title, ylabel="开启 − 关闭（毫秒）；负值为降低")
         axis.axhline(0, color="gray", linewidth=0.7)
     valid = sorted((r for r in rows if r["delta"] is not None), key=lambda r: r["factors"][0])
-    xs = [r["factors"][0] for r in valid]
+    xs = [positions[tuple(r["factors"])] for r in valid]
     axes[1, 0].scatter(xs, [r["delta"]["memo_expressions"] for r in valid],
                        color="#4477aa", label="表达式净增")
     cost_axis = axes[1, 0].twinx()
@@ -1273,8 +1367,9 @@ def render_cbo_contribution(report: dict, output: Path, font: Path) -> None:
     for kind, label in (("ok", "诊断可比"), ("fallback", "关闭回退，开启正常"), ("other", "其他不可比或未运行")):
         def category(r):
             return "ok" if r["delta"] is not None else "fallback" if r["off_fallback_cbo_ok"] else "other"
-        counts = [sum(category(r) == kind and r["factors"] == [f] for r in rows) for f in factors]
-        axes[1, 1].bar(factors, counts, bottom=bottom, width=[f * 0.25 for f in factors], label=label)
+        counts = [sum(category(r) == kind and tuple(r["factors"]) == factor for r in rows) for factor in factors]
+        axes[1, 1].bar([positions[factor] for factor in factors], counts, bottom=bottom,
+                       width=[factor[0] * 0.25 for factor in factors] if logarithmic else 0.7, label=label)
         bottom = [b + c for b, c in zip(bottom, counts)]
     axes[1, 1].set(title="可执行性必须先于性能比较", ylabel="固定样本运行数；不是总体比例")
     axes[1, 1].legend()
@@ -1282,16 +1377,19 @@ def render_cbo_contribution(report: dict, output: Path, font: Path) -> None:
                                  ("target_ready", "目标生成候选", "x"),
                                  ("target_root_inserted", "目标根实际插入", "+")):
         available = [r for r in rows if r[field] is not None]
-        axes[2, 0].scatter([r["factors"][0] for r in available], [r[field] for r in available],
+        axes[2, 0].scatter([positions[tuple(r["factors"])] for r in available], [r[field] for r in available],
                            label=label, marker=marker, alpha=0.5)
     axes[2, 0].set(title="目标规则从尝试到根插入的漏斗", ylabel="开启臂次数；散点可能重叠")
     axes[2, 0].legend()
-    axes[2, 1].scatter([r["factors"][0] for r in valid], [r["other_rule_attempts_delta"] for r in valid], alpha=0.5)
+    axes[2, 1].scatter(xs, [r["other_rule_attempts_delta"] for r in valid], alpha=0.5)
     axes[2, 1].axhline(0, color="gray", linewidth=0.7)
     axes[2, 1].set(title="其他规则尝试的净变化（不是依赖边证明）", ylabel="开启 − 关闭；扣除目标自身尝试")
     for axis in axes.flat:
-        axis.set_xscale("log", base=2)
-        axis.set_xlabel("冻结原生估计的注入倍率")
+        if logarithmic:
+            axis.set_xscale("log", base=2)
+        else:
+            axis.set_xticks([positions[factor] for factor in factors], labels, rotation=15, ha="right")
+        axis.set_xlabel("冻结原生估计的注入倍率" if logarithmic else "预注册的联合注入因子组合")
         axis.grid(alpha=0.2)
     fig.suptitle(f"规则 {report['rule_hash']} 的代价搜索条件贡献｜未执行预改写实验臂\n"
                  "同统计、同随机区组配对；橙线仅对可比样本的组内均值设计加权，不代表完整总体\n"
@@ -1308,16 +1406,22 @@ def render_search_contribution(report: dict, output: Path, font: Path) -> None:
                ("prune:pruned", "实际下界剪枝检查"), ("properties:accepted", "物理属性检查通过"),
                ("lifecycle:best_updated", "更新当前最优"), ("selected_distinct_candidates", "最终采用的去重成本候选"))
     valid = [r for r in report["runs"] if (r.get("search") or {}).get("complete")]
+    factors, positions, labels, logarithmic = factor_axis(report)
     for axis, (field, label) in zip(axes.flat, metrics):
         for query in sorted({r.get("query", "单查询") for r in valid}):
             rows = sorted((r for r in valid if r.get("query", "单查询") == query),
-                          key=lambda r: r["factors"][0])
-            axis.plot([r["factors"][0] for r in rows], [r["search"]["delta"].get(field, 0) for r in rows],
+                          key=lambda r: positions[tuple(r["factors"])])
+            axis.plot([positions[tuple(r["factors"])] for r in rows],
+                      [r["search"]["delta"].get(field, 0) for r in rows],
                       "o--", label=query, alpha=0.75)
         axis.axhline(0, color="gray", linewidth=0.7)
-        axis.set(title=label, xlabel="该样本冻结基数的注入倍率", ylabel="开启 − 关闭（次数）", xscale="log")
-        factors = sorted({r["factors"][0] for r in valid})
-        axis.set_xticks(factors, [f"{factor:g}" for factor in factors])
+        axis.set(title=label, xlabel="该样本冻结基数的注入倍率" if logarithmic else "预注册的联合注入因子组合",
+                 ylabel="开启 − 关闭（次数）")
+        if logarithmic:
+            axis.set_xscale("log")
+        axis.set_xticks([positions[factor] for factor in factors],
+                        [f"{factor[0]:g}" for factor in factors] if logarithmic else labels,
+                        rotation=0 if logarithmic else 15, ha="center" if logarithmic else "right")
         axis.minorticks_off()
         axis.grid(alpha=0.2)
         if valid:
@@ -1531,12 +1635,14 @@ def render_candidate_cohort(report: dict, output: Path, font: Path) -> None:
 
 def parameter_candidate_evidence(manifest: dict, results: Path, contribution_rule: str | None = None) -> dict:
     """Each parameter instance is retained; no template-level search equivalence assumption."""
-    if manifest.get("sampling_unit") != "declared_parameter_instances":
-        raise ValueError("require a declared parameter-instance manifest")
-    if len({q["query"] for q in manifest["queries"]}) != len(manifest["queries"]):
+    sampling_unit = manifest.get("sampling_unit")
+    if sampling_unit not in ("declared_parameter_instances", "predeclared_application_case"):
+        raise ValueError("require declared parameter instances or application cases")
+    queries = manifest["queries" if sampling_unit == "declared_parameter_instances" else "cases"]
+    if len({q["query"] for q in queries}) != len(queries):
         raise ValueError("duplicate parameter instance")
     rows = []
-    for query in manifest["queries"]:
+    for query in queries:
         row = {**query, "status": "missing", "exclusions": [], "attempts": None,
                "memo_expressions": None, "rules": None, "result_rows": None,
                "state_coverage": None, "rule_state_coverage": None}
@@ -1565,6 +1671,11 @@ def parameter_candidate_evidence(manifest: dict, results: Path, contribution_rul
             observation = {"targets": [], "points": [{"file": experiment["path"],
                            "factors": [], "requested_rows": []}]}
             row["contribution"] = cbo_contribution(observation, comparison, path.parent, path.parent)[0]
+            for arm, dependency in row["contribution"]["dependencies"]["arms"].items():
+                if "edges" in dependency:  # legacy reports and injected test evidence
+                    edges = dependency.pop("edges")
+                    dependency["edge_count"] = len(edges) if edges is not None else None
+                dependency.setdefault("source", f"{path}:stats_experiments[0].modes.{arm}.rule_edges")
             row["target_states"] = row["contribution"].get("target_states")
         try:
             audit = candidate_evidence(run)
@@ -1594,8 +1705,10 @@ def parameter_candidate_evidence(manifest: dict, results: Path, contribution_rul
             for attempt in audit["rows"]:
                 by_rule[attempt["rule_hash"]].append(attempt)
             row["rule_state_coverage"] = {rule: state_coverage(attempts) for rule, attempts in by_rule.items()}
-    return {"scope": "within_template_parameter_mechanism_observations", "runs": rows,
+    return {"scope": ("predeclared_application_holdout" if sampling_unit == "predeclared_application_case"
+                       else "within_template_parameter_mechanism_observations"), "runs": rows,
             "rule_hash": contribution_rule,
+            "sampling_unit": sampling_unit, "split": manifest.get("split"),
             "parameter_design": manifest["parameter_design"],
             "state_observation": {"capture": "before_evaluation", "scope": "source_before_match_view",
                 "identity": "run_and_attempt_sequence_not_expression_fingerprint",
@@ -1604,7 +1717,8 @@ def parameter_candidate_evidence(manifest: dict, results: Path, contribution_rul
                                  "full_predicates_and_ordered_tree_topology"],
                 "excluded_from_pre_features": ["post_evaluation_bindings", "later_derived_statistics",
                                                "rule_outcomes", "query_local_identifiers"]},
-            "not_guaranteed": ["population_representativeness", "complete_search_space_identity", "runtime_speedup"]}
+            "not_guaranteed": list(dict.fromkeys([*manifest.get("not_guaranteed", []),
+                "population_representativeness", "complete_search_space_identity", "runtime_speedup"]))}
 
 
 def render_parameters(report: dict, output: Path, font: Path) -> None:
@@ -1675,12 +1789,16 @@ def render_parameter_contribution(report: dict, output: Path, font: Path) -> Non
             axes[index, 3].scatter([i] * len(values), values, color="#ee7733")
         axes[index, 3].axhline(0, color="gray", linewidth=0.7)
         axes[index, 3].set(title="直接根候选相对当时最优的成本差", ylabel="估算成本差；无可用候选留空，不填零")
+        application_cases = report.get("sampling_unit") == "predeclared_application_case"
         for axis in axes[index]:
-            axis.set_xticks(positions, ["／".join("空值" if v is None else str(v) for v in r["parameters"].values())
+            axis.set_xticks(positions, [(f"样本{i + 1}" if application_cases else
+                                        "／".join("空值" if v is None else str(v)
+                                                  for v in r["parameters"].values()))
                                        + f"\n输出{r.get('result_rows')}行"
                                        + ("\n关闭回退" if (r.get("contribution") or {}).get("off_fallback_cbo_ok") else "")
-                                       for r in rows])
-            axis.set_xlabel("声明的参数值；不同模板不是因果对照")
+                                       for i, r in enumerate(rows)])
+            axis.set_xlabel("样本编号（参数映射见同名 JSON）；不同模板不是因果对照"
+                            if application_cases else "声明的参数值；不同模板不是因果对照")
             axis.grid(axis="y", alpha=0.2)
         axes[index, 0].legend(fontsize=7)
         axes[index, 1].legend(fontsize=8)
@@ -1785,6 +1903,8 @@ def main() -> None:
                 parser.error("--cbo-contribution must name the comparison's profiled rule")
             report = {"scope": "single_query_cardinality_cbo_minus_off_not_generalization",
                       "rule_hash": rule_hash,
+                      "factor_coordinates": manifest.get("factor_design", {}).get("coordinates"),
+                      "factor_labels": manifest.get("factor_design", {}).get("coordinate_labels"),
                       "runs": cbo_contribution(manifest, comparison, args.sweep_manifest.parent,
                                                 args.comparison.parent)}
             args.output.parent.mkdir(parents=True, exist_ok=True)

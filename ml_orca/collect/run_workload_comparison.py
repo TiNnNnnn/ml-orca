@@ -50,6 +50,7 @@ SERVER_FAILURE_MARKERS = (
     "database system is not yet accepting connections",
     "connection refused",
 )
+TRACE_LINE_RE = re.compile(r"^.*DSL_TRACE \{.*$", re.MULTILINE)
 RULE_COUNTER_FIELDS = (
     "binding_attempts",
     "bound_symbols",
@@ -486,19 +487,99 @@ SET optimizer_print_xform_results={xform_trace};
 SET optimizer_print_optimization_stats=on;
 SET pg_orca.trace_dsl_rule=on;
 SET client_min_messages=log;
+SET log_min_messages=fatal;
 """.format(xform_trace=native_xform_trace)
 
 
-def trace_records(text: str) -> list[dict[str, Any]]:
+def expand_rule_edge_batch(record: dict[str, Any], rule_ids: dict[int, str] | None = None,
+                           candidates: dict[int, tuple[str, str]] | None = None) -> list[dict[str, Any]]:
+    version = record.get("schema_version")
+    if (version not in (1, 2, 3, 4) or record.get("engine") != "pgorca"
+            or record.get("scheduler") != "cbo" or not isinstance(record.get("edges"), list)
+            or (version == 1 and (not isinstance(record.get("dst_rule"), str)
+                                  or not isinstance(record.get("candidate_status"), str)
+                                  or type(record.get("dst_candidate_sequence")) is not int))
+            or (version == 4 and (type(record.get("first_edge_sequence")) is not int
+                                  or record["first_edge_sequence"] < 1))):
+        raise ValueError("invalid rule edge batch header")
+    result = []
+    for row in record["edges"]:
+        string_fields = ((0, 1, 2, 7, 8) if version == 1 else
+                         (0, 1, 2, 3, 4, 10, 11) if version == 2 else (2, 3))
+        integer_fields = ((3, 4, 5, 6) if version == 1 else
+                          (5, 6, 7, 8, 9) if version == 2 else
+                          (0, 1, 4, 5, 6, 7, 8, 9, 10, 11) if version == 3 else
+                          (0, 1, 4, 5, 6, 7))
+        expected_length = 9 if version == 1 else 12 if version in (2, 3) else 8
+        if (not isinstance(row, list) or len(row) != expected_length
+                or any(not isinstance(row[index], str) for index in string_fields)
+                or any(type(row[index]) is not int or row[index] < 0 for index in integer_fields)):
+            raise ValueError("invalid rule edge batch row")
+        if version == 1:
+            src_rule, target_path, binding_path, src_sequence, edge_sequence, group, expression, relation, outcome = row
+            dst_rule, status, dst_sequence = (record["dst_rule"], record["candidate_status"],
+                                               record["dst_candidate_sequence"])
+        elif version == 2:
+            (src_rule, dst_rule, target_path, binding_path, status, dst_sequence,
+             src_sequence, edge_sequence, group, expression, relation, outcome) = row
+        elif version == 3:
+            (src_id, dst_id, target_path, binding_path, status_id, dst_sequence,
+             src_sequence, edge_sequence, group, expression, relation_id, outcome_id) = row
+            if (rule_ids is None or src_id not in rule_ids or dst_id not in rule_ids
+                    or status_id not in range(7) or relation_id not in range(2)
+                    or outcome_id not in range(3)):
+                raise ValueError("unresolved rule edge batch dictionary")
+            src_rule, dst_rule = rule_ids[src_id], rule_ids[dst_id]
+            status = ("match_rejected", "constraint_rejected", "instantiate_rejected", "ready_cbo",
+                      "duplicate", "budget_exhausted", "budget_skipped")[status_id]
+            relation = ("memo_consumes", "input_exposes")[relation_id]
+            outcome = ("memo_inserted", "memo_duplicate", "memo_rehashed")[outcome_id]
+        else:
+            (dst_sequence, src_sequence, target_path, binding_path, group, expression,
+             relation_id, outcome_id) = row
+            if (candidates is None or src_sequence not in candidates or dst_sequence not in candidates
+                    or relation_id not in range(2) or outcome_id not in range(3)):
+                raise ValueError("unresolved rule edge batch candidate")
+            src_rule = candidates[src_sequence][0]
+            dst_rule, status = candidates[dst_sequence]
+            relation = ("memo_consumes", "input_exposes")[relation_id]
+            outcome = ("memo_inserted", "memo_duplicate", "memo_rehashed")[outcome_id]
+            edge_sequence = record["first_edge_sequence"] + len(result)
+        result.append({"kind": "rule_edge", "engine": "pgorca", "scheduler": "cbo",
+                       "src_rule": src_rule, "dst_rule": dst_rule,
+                       "target_path": target_path, "src_target_path": target_path,
+                       "dst_source_path": "r" if binding_path == "r" else None,
+                       "dst_binding_path": binding_path,
+                       "path_kind": ("instantiated_expression" if binding_path == "r"
+                                     else "source_binding_expression"),
+                       "candidate_status": status,
+                       "dst_candidate_sequence": dst_sequence,
+                       "src_candidate_sequence": src_sequence,
+                       "binding_edge_sequence": edge_sequence,
+                       "binding_group": group, "binding_group_expression": expression,
+                       "evidence": "runtime_observed",
+                       "relation": relation if status == "ready_cbo" else "binding_observed",
+                       "producer_relation": relation, "producer_outcome": outcome})
+    return result
+
+
+def trace_records(text: str, exclude_kinds: set[str] | None = None) -> list[dict[str, Any]]:
     records = []
     contexts = {}
     search_started = False
     query_input = None
+    rule_ids = {}
+    candidates = {}
     fragments = ContextFragments()
-    for line in text.splitlines():
-        if "DSL_TRACE {" not in line:
-            continue
+    for line_match in TRACE_LINE_RE.finditer(text):
+        line = line_match.group(0)
         payload = line.split("DSL_TRACE ", 1)[1]
+        if exclude_kinds:
+            match = re.match(r'\s*\{\s*"kind"\s*:\s*"([^"]+)"', payload)
+            logical_kind = "rule_edge" if match and match.group(1) == "rule_edge_batch" else (
+                match.group(1) if match else None)
+            if logical_kind in exclude_kinds:
+                continue
         try:
             record = json.loads(payload[: payload.rfind("}") + 1])
         except (ValueError, json.JSONDecodeError):
@@ -506,6 +587,16 @@ def trace_records(text: str) -> list[dict[str, Any]]:
         record = fragments.accept(record)
         if record is None:
             continue
+        if record.get("kind") == "rule_edge_batch":
+            records.extend(expand_rule_edge_batch(record, rule_ids, candidates))
+            continue
+        if type(record.get("rule_id")) is int and isinstance(record.get("rule_hash"), str):
+            previous = rule_ids.setdefault(record["rule_id"], record["rule_hash"])
+            if previous != record["rule_hash"]:
+                raise ValueError("conflicting rule trace dictionary")
+        if (record.get("kind") == "rule_candidate" and type(record.get("sequence")) is int
+                and isinstance(record.get("rule_hash"), str) and isinstance(record.get("status"), str)):
+            candidates[record["sequence"]] = (record["rule_hash"], record["status"])
         if record.get("kind") == "candidate_context":
             key = record.get("field"), record.get("context_id")
             if key[0] not in ("input_context", "binding_context", "query_input_context", "route_input_context") or type(key[1]) is not int or key[1] < 1:
@@ -545,6 +636,25 @@ def trace_records(text: str) -> list[dict[str, Any]]:
             query_input = None
     fragments.finish()
     return records
+
+
+def trace_kind_count(text: str, kind: str) -> int:
+    pattern = re.compile(r'DSL_TRACE\s+\{\s*"kind"\s*:\s*"' + re.escape(kind) + r'"')
+    count = sum(1 for _ in pattern.finditer(text))
+    if kind != "rule_edge":
+        return count
+    for line_match in TRACE_LINE_RE.finditer(text):
+        line = line_match.group(0)
+        if re.search(r'DSL_TRACE\s+\{\s*"kind"\s*:\s*"rule_edge_batch"', line) is None:
+            continue
+        payload = line.split("DSL_TRACE ", 1)[1]
+        try:
+            record = json.loads(payload[: payload.rfind("}") + 1])
+            if record.get("schema_version") in (1, 2, 3, 4) and isinstance(record.get("edges"), list):
+                count += len(record["edges"])
+        except (ValueError, TypeError, json.JSONDecodeError):
+            continue
+    return count
 
 
 def error_summary(text: str) -> str:
@@ -999,12 +1109,23 @@ def run_mode(
     else:
         rows_out, rows_err, rows_rc, rows_ms = "", "", plan_rc, 0.0
     (artifact / f"{artifact_name}.plan.json").write_text(plan_out, encoding="utf-8")
-    (artifact / f"{artifact_name}.trace").write_text(plan_err, encoding="utf-8")
+    trace_path = artifact / f"{artifact_name}.trace"
+    trace_path.write_text(plan_err, encoding="utf-8")
     # Preserve COPY output and errors, including partial failures. The recorded
     # rows_rc/rows_skipped distinguish completed results from incomplete output.
     (artifact / f"{artifact_name}.rows.csv").write_text(rows_out, encoding="utf-8")
     (artifact / f"{artifact_name}.rows.stderr").write_text(rows_err, encoding="utf-8")
-    records = trace_records(plan_err)
+    # The raw trace is the authoritative lossless edge stream.  Keeping the
+    # same high-cardinality records in comparison.json can multiply a trace by
+    # every live arm and make post-processing dominate optimization itself.
+    edge_count = trace_kind_count(plan_err, "rule_edge")
+    records = trace_records(plan_err, {"rule_edge"})
+    outcomes = [record for record in records if record.get("kind") == "experiment_outcome"]
+    expected_edges = outcomes[0].get("binding_origin_edges") if len(outcomes) == 1 else None
+    candidate_events = [record for record in records
+                        if record.get("kind") in {"rule_candidate", "rule_candidate_outcome"}]
+    candidate_count = sum(record.get("kind") == "rule_candidate" for record in candidate_events)
+    expected_candidates = outcomes[0].get("rule_candidates") if len(outcomes) == 1 else None
     optimizer = optimizer_name(plan_out)
     planning_ms, execution_ms = explain_times(plan_out)
     return {
@@ -1060,8 +1181,19 @@ def run_mode(
             record for record in records
             if record.get("kind") in {"stats_injection", "stats_observation"}
         ],
-        "candidate_events": [record for record in records
-                             if record.get("kind") in {"rule_candidate", "rule_candidate_outcome"}],
+        # Failed attempts retain their partial candidate stream only in the raw
+        # trace; duplicating hundreds of MB into comparison.json cannot make an
+        # incomplete run admissible evidence.
+        "candidate_events": candidate_events if plan_rc == 0 else [],
+        "candidate_events_source": {
+            "artifact": trace_path.name,
+            "format": "dsl_trace_jsonl",
+            "candidate_count": candidate_count,
+            "expected_count": expected_candidates,
+            "count_complete": (expected_candidates == candidate_count
+                               if type(expected_candidates) is int else False),
+            "embedded": plan_rc == 0,
+        },
         "query_input_contexts": [record['value'] for record in records
                                  if record.get('kind') == 'candidate_context' and record.get('field') == 'query_input_context'],
         "rule_route_inputs": [record for record in records if record.get("kind") == "rule_route"],
@@ -1071,11 +1203,15 @@ def run_mode(
         "cost_lifecycle_events": [record for record in records if record.get("kind") == "cost_lifecycle"],
         "optimizer_progress": [record for record in records if record.get("kind") == "optimizer_progress"],
         "search_checks": [record for record in records if record.get("kind") == "search_check"],
-        "rule_edges": [record for record in records if record.get("kind") == "rule_edge"],
-        "experiment_outcomes": [
-            record for record in records
-            if record.get("kind") == "experiment_outcome"
-        ],
+        "rule_edges_source": {
+            "artifact": trace_path.name,
+            "format": "dsl_trace_jsonl",
+            "count": edge_count,
+            "expected_count": expected_edges,
+            "count_complete": expected_edges == edge_count if type(expected_edges) is int else None,
+            "bytes": trace_path.stat().st_size,
+        },
+        "experiment_outcomes": outcomes,
         "dsl_observability": dsl_observability(records),
         "dphyper_events": parse_dphyper_events(plan_err),
         "native_memo_origins": sorted({

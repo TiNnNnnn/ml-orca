@@ -64,6 +64,102 @@ def instantiate_relations(sql: str, relations: dict[str, str]) -> str:
     return tree.sql(dialect="postgres", pretty=True) + ";\n"
 
 
+def write_relation_workload(specification: Path, output: Path) -> dict:
+    """Freeze predeclared Input-subtree substitutions as a runner workload."""
+    raw_spec = specification.read_bytes()
+    spec = json.loads(raw_spec)
+    base = specification.parent
+    workload = spec.get("workload")
+    template = spec.get("template")
+    if (spec.get("schema_version") != 1 or not isinstance(workload, str)
+            or not re.fullmatch(r"[a-z][a-z0-9_]*", workload)
+            or not isinstance(template, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", template)):
+        raise ValueError("require schema_version 1 and safe workload/template names")
+
+    def read(relative: str) -> tuple[Path, bytes]:
+        path = (base / relative).resolve()
+        if not path.is_file():
+            raise ValueError(f"missing input file: {relative}")
+        return path, path.read_bytes()
+
+    source_path, source_raw = read(spec["source_sql"])
+    target_path, target_raw = read(spec["target_sql"])
+    schema_path, schema = read(spec["schema_sql"])
+    setup_parts = [read(path) for path in spec.get("setup_sql", [])]
+    if not spec.get("cases"):
+        raise ValueError("require predeclared relation cases")
+
+    def relation_names(sql: bytes) -> set[str]:
+        statements = sqlglot.parse(sql.decode(), read="postgres")
+        if len(statements) != 1 or not isinstance(statements[0], exp.Query):
+            raise ValueError("source and target must contain one query")
+        return {table.name for table in statements[0].find_all(exp.Table)}
+
+    expected = relation_names(source_raw) | relation_names(target_raw)
+    entries, rendered, ids = [], {}, set()
+    for case in spec["cases"]:
+        case_id = case.get("id")
+        if (not isinstance(case_id, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", case_id)
+                or case_id in ids):
+            raise ValueError("case IDs must be unique safe path components")
+        ids.add(case_id)
+        relation_files = case.get("relations")
+        if not isinstance(relation_files, dict) or set(relation_files) != expected:
+            raise ValueError("each case must replace every relation exactly once")
+        relations, inputs = {}, []
+        for name, relative in relation_files.items():
+            path, raw = read(relative)
+            relations[name] = raw.decode()
+            inputs.append({"relation": name, "path": str(path),
+                           "crc32": f"{zlib.crc32(raw):08x}"})
+        source = instantiate_relations(source_raw.decode(), relations)
+        target = instantiate_relations(target_raw.decode(), relations)
+        rendered[case_id] = (source, target)
+        parameters = case.get("parameters")
+        if not isinstance(parameters, dict) or not parameters:
+            raise ValueError("each case requires declared parameters")
+        entries.append({"query": f"{workload}/{case_id}", "case": case_id,
+                        "template": template, "parameters": parameters,
+                        "split": case.get("split"), "relations": inputs,
+                        "query_crc32": f"{zlib.crc32(source.encode()):08x}",
+                        "source_crc32": f"{zlib.crc32(source.encode()):08x}",
+                        "target_crc32": f"{zlib.crc32(target.encode()):08x}"})
+
+    if any(entry["split"] != "holdout" for entry in entries):
+        raise ValueError("relation workload currently requires an explicit holdout split")
+    output.mkdir(parents=True, exist_ok=False)
+    destination = output / workload
+    (destination / "sql").mkdir(parents=True)
+    (output / "checks").mkdir()
+    (destination / "schema.sql").write_bytes(schema)
+    setup = b"\n".join(raw for _, raw in setup_parts)
+    (output / "setup.sql").write_bytes(setup)
+    for case_id, (source, target) in rendered.items():
+        (destination / "sql" / f"{case_id}.sql").write_text(source)
+        (output / "checks" / f"{case_id}_target.sql").write_text(target)
+        left, right = source.rstrip(";\n"), target.rstrip(";\n")
+        comparison = ("SELECT COUNT(*) AS differences FROM (((" + left
+                      + ") EXCEPT ALL (" + right + ")) UNION ALL ((" + right
+                      + ") EXCEPT ALL (" + left + "))) AS difference_rows;\n")
+        (output / "checks" / f"{case_id}_equivalence.sql").write_text(comparison)
+    manifest = {
+        "schema_version": 1, "sampling_unit": "predeclared_application_case",
+        "split": "holdout", "workload": workload,
+        "template": template, "parameter_design": spec.get("parameter_design"),
+        "source_specification": str(specification.resolve()),
+        "specification_crc32": f"{zlib.crc32(raw_spec):08x}",
+        "source_template": {"path": str(source_path), "crc32": f"{zlib.crc32(source_raw):08x}"},
+        "target_template": {"path": str(target_path), "crc32": f"{zlib.crc32(target_raw):08x}"},
+        "schema": {"path": str(schema_path), "crc32": f"{zlib.crc32(schema):08x}"},
+        "setup": [{"path": str(path), "crc32": f"{zlib.crc32(raw):08x}"}
+                  for path, raw in setup_parts],
+        "cases": entries,
+        "not_guaranteed": ["population_representativeness", "independent_rule_equivalence_proof"],
+    }
+    (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
 def write_workload(specification: Path, source_root: Path, output: Path) -> dict:
     raw_spec = specification.read_bytes()
     spec = json.loads(raw_spec)
@@ -116,12 +212,16 @@ def write_workload(specification: Path, source_root: Path, output: Path) -> dict
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--spec", type=Path, required=True)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--spec", type=Path)
+    group.add_argument("--relation-spec", type=Path)
     parser.add_argument("--workload-root", type=Path, default=TEST_ASSETS / "workloads")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    manifest = write_workload(args.spec, args.workload_root, args.output)
-    print(json.dumps({"instances": len(manifest["queries"]), "output": str(args.output)}))
+    manifest = (write_relation_workload(args.relation_spec, args.output) if args.relation_spec
+                else write_workload(args.spec, args.workload_root, args.output))
+    print(json.dumps({"instances": len(manifest.get("queries", manifest.get("cases", []))),
+                      "output": str(args.output)}))
 
 
 if __name__ == "__main__":
