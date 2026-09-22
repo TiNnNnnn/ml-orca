@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from ml_orca.encoding.rule_policy_encoding import (catalog_sequences, encode_sequence, fit_vocabulary,
-                                  input_sequences, number, policy_sequence, rule_sequence)
+                                  input_sequences, number, policy_sequence, rule_sequence, rule_structure)
 
 
 def ir_fixture():
@@ -34,6 +34,52 @@ def catalog_fixture():
 
 
 class EncodingTest(unittest.TestCase):
+    def test_expression_bindings_are_versioned_typed_and_acyclic(self):
+        ir = ir_fixture()
+        ir.update(schema_version=2, bindings=[{'kind': 'Not', 'mode': 'build', 'symbols': [5, 0]}])
+        self.assertIn(('binding_kind:Not', None), rule_sequence(ir))
+        not_true = {**ir, 'bindings': [{'kind': 'NotTrue', 'mode': 'build', 'symbols': [5, 0]}]}
+        self.assertIn(('binding_kind:NotTrue', None), rule_sequence(not_true))
+        self.assertNotEqual(rule_sequence(ir), rule_sequence(not_true))
+        self.assertNotEqual(rule_structure(ir), rule_structure(not_true))
+        for kind in ('And', 'Or'):
+            binary = {**ir, 'bindings': [{'kind': kind, 'mode': 'build', 'symbols': [5, 0, 2]}]}
+            self.assertIn(('binding_kind:' + kind, None), rule_sequence(binary))
+            with self.assertRaises(ValueError):
+                rule_sequence({**ir, 'bindings': [{'kind': kind, 'mode': 'build', 'symbols': [5, 0]}]})
+        self.assertNotEqual(
+            rule_sequence({**ir, 'bindings': [{'kind': 'And', 'mode': 'build', 'symbols': [5, 0, 2]}]}),
+            rule_sequence({**ir, 'bindings': [{'kind': 'Or', 'mode': 'build', 'symbols': [5, 0, 2]}]}))
+        for binding in ({'kind': 'Unknown', 'mode': 'build', 'symbols': [5, 0]},
+                        {'kind': 'Not', 'mode': 'match', 'symbols': [5, 0]},
+                        {'kind': 'Not', 'mode': 'build', 'symbols': [5, 1]},
+                        {'kind': 'Ref', 'mode': 'build', 'symbols': [5, 5]},
+                        {'kind': 'Not', 'mode': 'build', 'symbols': [5, 99]}):
+            with self.assertRaises(ValueError):
+                rule_sequence({**ir, 'bindings': [binding]})
+        with self.assertRaises(ValueError):
+            rule_sequence({**ir, 'schema_version': 1})
+        with self.assertRaises(ValueError):
+            rule_sequence({**ir, 'bindings': ir['bindings'] * 2})
+        with self.assertRaisesRegex(ValueError, 'cyclic'):
+            rule_sequence({**ir, 'bindings': [{'kind': 'Not', 'mode': 'build', 'symbols': refs}
+                                            for refs in ([5, 7], [7, 5])]})
+
+    def test_mixed_type_bindings_preserve_signatures(self):
+        ir = ir_fixture()
+        ir.update(schema_version=2, bindings=[
+            {'kind': 'NullSafeEq', 'mode': 'build', 'symbols': [5, 1, 3]},
+            {'kind': 'Ref', 'mode': 'build', 'symbols': [6, 1]}])
+        self.assertIn(('binding_kind:NullSafeEq', None), rule_sequence(ir))
+        self.assertNotEqual(rule_structure(ir), rule_structure({**ir, 'bindings': [
+            {**ir['bindings'][0], 'symbols': [5, 3, 1]}, ir['bindings'][1]]}))
+        for refs in ([5, 0, 3], [5, 1], [6, 1, 3]):
+            with self.assertRaises(ValueError):
+                rule_sequence({**ir, 'bindings': [
+                    {'kind': 'NullSafeEq', 'mode': 'build', 'symbols': refs}]})
+        with self.assertRaises(ValueError):
+            rule_sequence({**ir, 'bindings': [{'kind': 'Ref', 'mode': 'build', 'symbols': [6, 0]}]})
+
     def test_structure_and_reference_information_survives(self):
         ir = ir_fixture()
         original = rule_sequence(ir)

@@ -58,6 +58,23 @@ class RuleTreeModelTest(unittest.TestCase):
     def tearDown(self):
         torch.set_num_threads(self.threads)
 
+    def test_expression_trees_use_existing_encoder_and_keep_relational_ports(self):
+        from ml_orca.models.rule_tree_model import TreePolicyPredictor
+        ir = ir_fixture()
+        ir.update(schema_version=2, bindings=[{'kind': 'Not', 'mode': 'build', 'symbols': [5, 0]}])
+        other = deepcopy(ir)
+        other['bindings'][0].update(kind='And', symbols=[5, 0, 2])
+        features, vocabulary = tree_features([ir, other], ('r', 'r/0'))
+        model = TreePolicyPredictor(len(vocabulary), 8)
+        result = model(features)
+        self.assertTrue(torch.isfinite(result).all())
+        result.square().sum().backward()
+        self.assertGreater(model.rule_trees.child_order.weight_ih_l0.grad.abs().sum().item(), 0)
+        self.assertNotEqual(rule_structure(ir), rule_structure(other))
+        structure = rule_structure(ir)
+        with self.assertRaises(ValueError):
+            rule_root_index(structure, 'target', 'r/1')
+
     def test_pre_memo_query_tree_is_explicit_trainable_and_preserves_legacy_defaults(self):
         from ml_orca.models.rule_tree_model import TreePolicyPredictor
         features, vocabulary = tree_features([ir_fixture(), ir_fixture()], ('r', 'r/0'))

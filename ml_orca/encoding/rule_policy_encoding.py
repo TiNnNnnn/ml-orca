@@ -34,8 +34,11 @@ def flag(out, field, value):
 
 def rule_sequence(ir):
     """Prefix trees retain ordered children and canonical, rule-local symbol links."""
-    if ir.get('schema_version') != 1:
-        raise ValueError('require native learning_ir version 1')
+    version = ir.get('schema_version')
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError('require native learning_ir version 1 or 2')
+    if (version == 1 and 'bindings' in ir) or (version == 2 and not isinstance(ir.get('bindings'), list)):
+        raise ValueError('expression bindings require learning_ir version 2')
     out, seen = [], []
     symbols = ir['symbols']
     for symbol in symbols:
@@ -72,6 +75,46 @@ def rule_sequence(ir):
             raise ValueError('unexpected native constraint fields')
         category(out, 'constraint', constraint['kind'])
         references(constraint['symbols'])
+    definitions = {}
+    if version == 2:
+        number(out, 'bindings', len(ir['bindings']))
+        for binding in ir['bindings']:
+            if (set(binding) != {'kind', 'mode', 'symbols'}
+                    or binding['kind'] not in ('Not', 'NotTrue', 'And', 'Or', 'Ref', 'NullSafeEq')
+                    or binding['mode'] not in ('match', 'build')
+                    or (binding['kind'] == 'Ref' and binding['mode'] != 'build')
+                    or not isinstance(binding['symbols'], list)
+                    or len(binding['symbols']) != (3 if binding['kind'] in ('And', 'Or', 'NullSafeEq') else 2)):
+                raise ValueError('invalid expression binding')
+            category(out, 'binding_kind', binding['kind'])
+            category(out, 'binding_mode', binding['mode'])
+            references(binding['symbols'])
+            result, *operands = binding['symbols']
+            side = 'source' if binding['mode'] == 'match' else 'target'
+            types = [symbols[ref]['kind'] for ref in binding['symbols']]
+            signatures = ([['p', 'a', 'a']] if binding['kind'] == 'NullSafeEq' else
+                          [['p', 'p'], ['a', 'a']] if binding['kind'] == 'Ref' else
+                          [['p'] * len(binding['symbols'])])
+            if (result in definitions or symbols[result]['side'] != side
+                    or types not in signatures
+                    or (side == 'source' and any(symbols[ref]['side'] != side for ref in operands))):
+                raise ValueError('invalid expression binding symbols')
+            definitions[result] = operands
+        done, active = set(), set()
+
+        def validate(ref):
+            if ref in active:
+                raise ValueError('cyclic expression binding')
+            if ref in done:
+                return
+            active.add(ref)
+            for operand in definitions.get(ref, []):
+                validate(operand)
+            active.remove(ref)
+            done.add(ref)
+
+        for ref in definitions:
+            validate(ref)
     if seen != list(range(len(symbols))):
         raise ValueError('IR symbols are not encounter-order canonical')
     return out
@@ -102,9 +145,24 @@ def rule_structure(ir):
     symbols = ir['symbols']
     sequences = {'rule_node': [], 'rule_symbol': [], 'rule_constraint': []}
     occurrences = [[] for _ in symbols]
+    definitions = {b['symbols'][0]: b for b in ir.get('bindings', [])}
 
-    def visit(node, side, path):
-        children = [visit(child, side, path + '/' + str(i)) for i, child in enumerate(node['children'])]
+    def expression(ref):
+        definition = definitions.get(ref)
+        return {'op': ('Expression:' + definition['mode'] + ':' + definition['kind']
+                       if definition else 'Expression:Capture'),
+                'symbols': [ref], 'children': [expression(operand) for operand in definition['symbols'][1:]]
+                if definition else []}
+
+    def visit(node, side, path, scalar=False):
+        children = [visit(child, side, path + '/' + str(i), scalar) for i, child in enumerate(node['children'])]
+        if not scalar:
+            for slot, ref in enumerate(node['symbols']):
+                if ref in definitions:
+                    child = expression(ref)
+                    # Keep slot identity even when some parameters are opaque.
+                    child['op'] = 'slot:' + str(slot) + ':' + child['op']
+                    children.append(visit(child, side, path + '/' + str(len(children)), True))
         index = len(nodes)
         features = [(side, None), ('op:' + node['op'], None), ('children', len(children)),
                     ('symbol_slots', len(node['symbols']))]
@@ -113,6 +171,8 @@ def rule_structure(ir):
             features.append(('ref:' + symbol['kind'] + ':' + symbol['side'], ref))
             occurrences[ref].append([index, slot])
         nodes.append({'side': side, 'path': path, 'children': children, 'symbols': list(node['symbols'])})
+        if definitions and not scalar:
+            nodes[-1]['relational_arity'] = len(node['children'])
         sequences['rule_node'].append(features)
         return index
 
@@ -122,10 +182,14 @@ def rule_structure(ir):
         sequences['rule_symbol'].append([('symbol_kind:' + symbol['kind'], None),
                                         ('symbol_side:' + symbol['side'], None), ('symbol_ref', ref)])
     constraints = []
-    for constraint in ir['constraints']:
-        features = [('constraint:' + constraint['kind'], None), ('arguments', len(constraint['symbols']))]
+    # Reuse the existing symbol-incidence channel, but never label a definition
+    # as a semantic premise. This also retains definitions not reached by a slot.
+    relations = [('constraint:' + c['kind'], c['symbols']) for c in ir['constraints']]
+    relations += [('binding:' + b['mode'] + ':' + b['kind'], b['symbols']) for b in ir.get('bindings', [])]
+    for kind, refs in relations:
+        features = [(kind, None), ('arguments', len(refs))]
         references = []
-        for ref in constraint['symbols']:
+        for ref in refs:
             symbol = symbols[ref]
             references.append({'token': len(features), 'symbol': ref})
             features.append(('ref:' + symbol['kind'] + ':' + symbol['side'], ref))
@@ -142,7 +206,7 @@ def rule_root_index(structure, side, path):
     index = structure['roots'][side]
     for step in path.split('/')[1:]:
         children = structure['nodes'][index]['children']
-        if int(step) >= len(children):
+        if int(step) >= structure['nodes'][index].get('relational_arity', len(children)):
             raise ValueError('dependency root is not a node in the declared rule template')
         index = children[int(step)]
     return index
